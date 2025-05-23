@@ -17,7 +17,7 @@ import contextlib
 from typing import Any, Mapping, Tuple
 
 import chex
-from graphcast import predictor_base
+from common import predictor_base
 import haiku as hk
 import jax
 import jax.numpy as jnp

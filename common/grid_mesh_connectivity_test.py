@@ -14,8 +14,8 @@
 """Tests for graphcast.grid_mesh_connectivity."""
 
 from absl.testing import absltest
-from graphcast import grid_mesh_connectivity
-from graphcast import icosahedral_mesh
+from common import grid_mesh_connectivity
+from common import icosahedral_mesh
 import numpy as np
 
 

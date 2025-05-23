@@ -27,8 +27,8 @@ import dataclasses
 import logging
 from typing import Any, Callable, Literal, Optional, Tuple
 
-from graphcast import mlp as mlp_builder
-from graphcast import sparse_transformer_utils as utils
+from common import mlp as mlp_builder
+from gencast import sparse_transformer_utils as utils
 import haiku as hk
 import jax
 from jax.experimental.pallas.ops.tpu import splash_attention

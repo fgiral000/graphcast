@@ -19,7 +19,7 @@ NaNless predictions.
 
 from typing import Optional, Tuple
 
-from graphcast import predictor_base as base
+from common import predictor_base as base
 import numpy as np
 import xarray
 

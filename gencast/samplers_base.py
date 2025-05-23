@@ -16,7 +16,7 @@
 import abc
 from typing import Optional
 
-from graphcast import denoisers_base
+from gencast import denoisers_base
 import xarray
 
 

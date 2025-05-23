@@ -16,10 +16,10 @@
 from typing import Optional
 
 from graphcast import casting
-from graphcast import denoisers_base
-from graphcast import samplers_base as base
-from graphcast import samplers_utils as utils
-from graphcast import xarray_jax
+from gencast import denoisers_base
+from gencast import samplers_base as base
+from gencast import samplers_utils as utils
+from common import xarray_jax
 import haiku as hk
 import jax.numpy as jnp
 import xarray

@@ -19,8 +19,8 @@ from typing import Any, cast, Optional, Tuple
 
 import chex
 from dinosaur import spherical_harmonic
-from graphcast import xarray_jax
-from graphcast import xarray_tree
+from common import xarray_jax
+from common import xarray_tree
 import haiku as hk
 import jax
 import jax.numpy as jnp

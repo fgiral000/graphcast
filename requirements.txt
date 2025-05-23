@@ -1,0 +1,15 @@
+jax[cuda12]
+jaxlib
+flax
+jraph
+dask
+trimesh
+xarray
+xarray-tensorstore
+dm-tree
+cartopy
+chex
+matplotlib
+numpy
+pandas
+scipy

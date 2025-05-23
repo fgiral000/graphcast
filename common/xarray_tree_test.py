@@ -14,7 +14,7 @@
 """Tests for xarray_tree."""
 
 from absl.testing import absltest
-from graphcast import xarray_tree
+from common import xarray_tree
 import numpy as np
 import xarray
 

@@ -17,15 +17,15 @@ import dataclasses
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import chex
-from graphcast import deep_typed_graph_net
-from graphcast import denoisers_base as base
-from graphcast import grid_mesh_connectivity
-from graphcast import icosahedral_mesh
-from graphcast import model_utils
-from graphcast import sparse_transformer
-from graphcast import transformer
-from graphcast import typed_graph
-from graphcast import xarray_jax
+from common import deep_typed_graph_net
+from gencast import denoisers_base as base
+from common import grid_mesh_connectivity
+from common import icosahedral_mesh
+from common import model_utils
+from gencast import sparse_transformer
+from gencast import transformer
+from common import typed_graph
+from common import xarray_jax
 import haiku as hk
 import jax
 import jax.numpy as jnp

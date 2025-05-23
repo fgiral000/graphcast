@@ -24,13 +24,13 @@ from typing import Any, Optional, Tuple
 
 import chex
 from graphcast import casting
-from graphcast import denoiser
-from graphcast import dpm_solver_plus_plus_2s
+from gencast import denoiser
+from gencast import dpm_solver_plus_plus_2s
 from graphcast import graphcast
-from graphcast import losses
-from graphcast import predictor_base
-from graphcast import samplers_utils
-from graphcast import xarray_jax
+from common import losses
+from common import predictor_base
+from gencast import samplers_utils
+from common import xarray_jax
 import haiku as hk
 import jax
 import xarray

@@ -20,7 +20,7 @@ with a [nodes, batch, ...] ordering of the inputs.
 
 from typing import Any, Mapping, Optional
 
-from graphcast import typed_graph
+from common import typed_graph
 import haiku as hk
 import jax
 import jax.numpy as jnp

@@ -17,10 +17,13 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 
+import flax.nnx as nnx
 
 # TODO(aelkadi): Move the mlp factory here from `deep_typed_graph_net.py`.
 
 
+
+### Haiku modules ###
 class LinearNormConditioning(hk.Module):
   """Module for norm conditioning.
 
@@ -43,3 +46,16 @@ class LinearNormConditioning(hk.Module):
     scale_minus_one, offset = jnp.split(conditional_scale_offset, 2, axis=-1)
     scale = scale_minus_one + 1.
     return inputs * scale + offset
+
+
+
+### Flax NNX modules ###
+class MLPFlax(nnx.Module):
+  """Module for norm conditioning.
+
+  Conditions the normalization of "inputs" by applying a linear layer to the
+  "norm_conditioning" which produces the scale and variance which are applied to
+  each channel (across the last dim) of "inputs".
+  """
+
+  pass

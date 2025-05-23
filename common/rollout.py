@@ -18,8 +18,8 @@ from typing import Iterator, Optional, Sequence
 from absl import logging
 import chex
 import dask.array
-from graphcast import xarray_jax
-from graphcast import xarray_tree
+from common import xarray_jax
+from common import xarray_tree
 import jax
 import numpy as np
 import typing_extensions

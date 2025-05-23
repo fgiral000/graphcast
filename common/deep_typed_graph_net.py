@@ -38,9 +38,9 @@ import functools
 from typing import Callable, List, Mapping, Optional, Tuple
 
 import chex
-from graphcast import mlp as mlp_builder
-from graphcast import typed_graph
-from graphcast import typed_graph_net
+from common import mlp as mlp_builder
+from common import typed_graph
+from common import typed_graph_net
 import haiku as hk
 import jax
 import jax.numpy as jnp

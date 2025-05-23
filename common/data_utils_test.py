@@ -16,7 +16,7 @@
 import datetime
 from absl.testing import absltest
 from absl.testing import parameterized
-from graphcast import data_utils
+from common import data_utils
 import numpy as np
 import xarray as xa
 

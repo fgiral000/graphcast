@@ -13,7 +13,7 @@
 # limitations under the License.
 """Tools for converting from regular grids on a sphere, to triangular meshes."""
 
-from graphcast import icosahedral_mesh
+from common import icosahedral_mesh
 import numpy as np
 import scipy
 import trimesh
