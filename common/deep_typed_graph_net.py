@@ -41,7 +41,9 @@ import chex
 from common import mlp as mlp_builder
 from common import typed_graph
 from common import typed_graph_net
-import haiku as hk
+
+import flax.nnx as nnx
+
 import jax
 import jax.numpy as jnp
 import jraph
@@ -50,7 +52,7 @@ import jraph
 GraphToGraphNetwork = Callable[[typed_graph.TypedGraph], typed_graph.TypedGraph]
 
 
-class DeepTypedGraphNet(hk.Module):
+class DeepTypedGraphNet(nnx.Module):
   """Deep Graph Neural Network.
 
   It works with TypedGraphs with typed nodes and edges. It runs message
@@ -77,10 +79,13 @@ class DeepTypedGraphNet(hk.Module):
     such that the weights used at each iteration are:
     [W_1, W_2, ... , W_N] * M
 
+    NOTE: this is a reimplementation of the original Haiku module using Flax NNX.
+
   """
 
   def __init__(self,
                *,
+               graph_template: typed_graph.TypedGraph,
                node_latent_size: Mapping[str, int],
                edge_latent_size: Mapping[str, int],
                mlp_hidden_size: int,
@@ -98,7 +103,8 @@ class DeepTypedGraphNet(hk.Module):
                f32_aggregation: bool = False,
                aggregate_edges_for_nodes_fn: str = "segment_sum",
                aggregate_normalization: Optional[float] = None,
-               name: str = "DeepTypedGraphNet"):
+               name: str = "DeepTypedGraphNet",
+               rngs: nnx.Rngs):
     """Inits the model.
 
     Args:
@@ -145,9 +151,7 @@ class DeepTypedGraphNet(hk.Module):
         segment_mean.
       name: Name of the model.
     """
-
-    super().__init__(name=name)
-
+    self._graph_template = graph_template
     self._node_latent_size = node_latent_size
     self._edge_latent_size = edge_latent_size
     self._mlp_hidden_size = mlp_hidden_size
@@ -172,98 +176,69 @@ class DeepTypedGraphNet(hk.Module):
     self._aggregate_edges_for_nodes_fn = _get_aggregate_edges_for_nodes_fn(
         aggregate_edges_for_nodes_fn)
     self._aggregate_normalization = aggregate_normalization
+    self._name = name
+    self._rngs = rngs
 
     if aggregate_normalization:
       # using aggregate_normalization only makes sense with segment_sum.
       assert aggregate_edges_for_nodes_fn == "segment_sum"
+
+    # Build the networks
+    self.embedder_network, self.processor_networks, self.decoder_network = (
+        self._networks_builder(graph_template=self._graph_template)
+    )
 
   def __call__(self,
                input_graph: typed_graph.TypedGraph,
                global_norm_conditioning: Optional[chex.Array] = None
                ) -> typed_graph.TypedGraph:
     """Forward pass of the learnable dynamics model."""
-    embedder_network, processor_networks, decoder_network = (
-        self._networks_builder(input_graph, global_norm_conditioning)
-    )
-
     # Embed input features (if applicable).
-    latent_graph_0 = self._embed(input_graph, embedder_network)
+    latent_graph_0 = self._embed(input_graph, self.embedder_network, global_norm_conditioning)
 
     # Do `m` message passing steps in the latent graphs.
-    latent_graph_m = self._process(latent_graph_0, processor_networks)
+    latent_graph_m = self._process(latent_graph_0, self.processor_networks, global_norm_conditioning)
 
     # Compute outputs from the last latent graph (if applicable).
-    return self._output(latent_graph_m, decoder_network)
+    return self._output(latent_graph_m, self.decoder_network)
 
   def _networks_builder(
       self,
       graph_template: typed_graph.TypedGraph,
-      global_norm_conditioning: Optional[chex.Array] = None,
   ) -> Tuple[
       GraphToGraphNetwork, List[GraphToGraphNetwork], GraphToGraphNetwork
   ]:
-    # TODO(aelkadi): move to mlp_builder.
-    def build_mlp(name, output_size):
-      mlp = hk.nets.MLP(
-          output_sizes=[self._mlp_hidden_size] * self._mlp_num_hidden_layers + [
-              output_size], name=name + "_mlp", activation=self._activation)
-      return jraph.concatenated_args(mlp)
-
-    def build_mlp_with_maybe_layer_norm(name, output_size):
-      network = build_mlp(name, output_size)
-      stages = [network]
-      if self._use_norm_conditioning:
-        if global_norm_conditioning is None:
-          raise ValueError(
-              "When using norm conditioning, `global_norm_conditioning` must"
-              "be passed to the call method.")
-        # If using norm conditioning, it is no longer the responsibility of the
-        # LayerNorm module itself to learn its scale and offset. These will be
-        # learned for the module by the norm conditioning layer instead.
-        create_scale = create_offset = False
-      else:
-        if global_norm_conditioning is not None:
-          raise ValueError(
-              "`globa_norm_conditioning` was passed, but `norm_conditioning`"
-              " is not enabled.")
-        create_scale = create_offset = True
-
-      if self._use_layer_norm:
-        layer_norm = hk.LayerNorm(
-            axis=-1, create_scale=create_scale, create_offset=create_offset,
-            name=name + "_layer_norm")
-        stages.append(layer_norm)
-
-      if self._use_norm_conditioning:
-        norm_conditioning_layer = mlp_builder.LinearNormConditioning(
-            name=name + "_norm_conditioning")
-        norm_conditioning_layer = functools.partial(
-            norm_conditioning_layer,
-            # Broadcast to the node/edge axis.
-            norm_conditioning=global_norm_conditioning[None],
-        )
-        stages.append(norm_conditioning_layer)
-
-      network = hk.Sequential(stages)
-      return jraph.concatenated_args(network)
 
     # The embedder graph network independently embeds edge and node features.
     if self._embed_edges:
       embed_edge_fn = _build_update_fns_for_edge_types(
-          build_mlp_with_maybe_layer_norm,
-          graph_template,
-          "encoder_edges_",
+          builder_fn=mlp_builder.MLPWithNormConditioning,
+          graph_template=graph_template,
+          mlp_hidden_size=self._mlp_hidden_size,
+          mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+          activation=self._activation,
+          use_layer_norm=self._use_layer_norm,
+          use_norm_conditioning=self._use_norm_conditioning,
+          rngs=self._rngs,
+          input_sizes=None,
           output_sizes=self._edge_latent_size)
     else:
       embed_edge_fn = None
     if self._embed_nodes:
       embed_node_fn = _build_update_fns_for_node_types(
-          build_mlp_with_maybe_layer_norm,
-          graph_template,
-          "encoder_nodes_",
+          builder_fn=mlp_builder.MLPWithNormConditioning,
+          graph_template=graph_template,
+          mlp_hidden_size=self._mlp_hidden_size,
+          mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+          activation=self._activation,
+          use_layer_norm=self._use_layer_norm,
+          use_norm_conditioning=self._use_norm_conditioning,
+          rngs=self._rngs,
+          input_sizes=None,
           output_sizes=self._node_latent_size)
     else:
       embed_node_fn = None
+    
     embedder_kwargs = dict(
         embed_edge_fn=embed_edge_fn,
         embed_node_fn=embed_node_fn,
@@ -297,14 +272,26 @@ class DeepTypedGraphNet(hk.Module):
       processor_networks.append(
           typed_graph_net.InteractionNetwork(
               update_edge_fn=_build_update_fns_for_edge_types(
-                  build_mlp_with_maybe_layer_norm,
-                  graph_template,
-                  f"processor_edges_{step_i}_",
+                  builder_fn=mlp_builder.MLPWithNormConditioning,
+                  graph_template=graph_template,
+                  mlp_hidden_size=self._mlp_hidden_size,
+                  mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+                  activation=self._activation,
+                  use_layer_norm=self._use_layer_norm,
+                  use_norm_conditioning=self._use_norm_conditioning,
+                  rngs=self._rngs,
+                  input_sizes=None,
                   output_sizes=self._edge_latent_size),
               update_node_fn=_build_update_fns_for_node_types(
-                  build_mlp_with_maybe_layer_norm,
-                  graph_template,
-                  f"processor_nodes_{step_i}_",
+                  builder_fn=mlp_builder.MLPWithNormConditioning,
+                  graph_template=graph_template,
+                  mlp_hidden_size=self._mlp_hidden_size,
+                  mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+                  activation=self._activation,
+                  use_layer_norm=self._use_layer_norm,
+                  use_norm_conditioning=self._use_norm_conditioning,
+                  rngs=self._rngs,
+                  input_sizes=None,
                   output_sizes=self._node_latent_size),
               aggregate_edges_for_nodes_fn=aggregate_fn,
               include_sent_messages_in_node_update=(
@@ -314,19 +301,40 @@ class DeepTypedGraphNet(hk.Module):
     # The output MLPs converts edge/node latent features into the output sizes.
     output_kwargs = dict(
         embed_edge_fn=_build_update_fns_for_edge_types(
-            build_mlp, graph_template, "decoder_edges_", self._edge_output_size)
+            builder_fn=mlp_builder.MLPWithNormConditioning,
+            graph_template=graph_template, 
+            mlp_hidden_size=self._mlp_hidden_size,
+            mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+            activation=self._activation,
+            use_layer_norm=False,
+            use_norm_conditioning=False,
+            rngs=self._rngs,
+            input_sizes=None,
+            output_sizes=self._edge_output_size)
         if self._edge_output_size else None,
         embed_node_fn=_build_update_fns_for_node_types(
-            build_mlp, graph_template, "decoder_nodes_", self._node_output_size)
+            builder_fn=mlp_builder.MLPWithNormConditioning, 
+            graph_template=graph_template, 
+            mlp_hidden_size=self._mlp_hidden_size,
+            mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+            activation=self._activation,
+            use_layer_norm=False,
+            use_norm_conditioning=False,
+            rngs=self._rngs,
+            input_sizes=None, 
+            output_sizes=self._node_output_size)
         if self._node_output_size else None,)
+    
     output_network = typed_graph_net.GraphMapFeatures(
         **output_kwargs)
+    
     return embedder_network, processor_networks, output_network
 
   def _embed(
       self,
       input_graph: typed_graph.TypedGraph,
       embedder_network: GraphToGraphNetwork,
+      global_norm_conditioning: Optional[chex.Array] = None
   ) -> typed_graph.TypedGraph:
     """Embeds the input graph features into a latent graph."""
 
@@ -350,13 +358,15 @@ class DeepTypedGraphNet(hk.Module):
           context=input_graph.context._replace(features=()))
 
     # Embeds the node and edge features.
-    latent_graph_0 = embedder_network(input_graph)
+    latent_graph_0 = embedder_network(input_graph, 
+                                      global_norm_conditioning)
     return latent_graph_0
 
   def _process(
       self,
       latent_graph_0: typed_graph.TypedGraph,
       processor_networks: List[GraphToGraphNetwork],
+      global_norm_conditioning: Optional[chex.Array] = None
   ) -> typed_graph.TypedGraph:
     """Processes the latent graph with several steps of message passing."""
 
@@ -366,17 +376,19 @@ class DeepTypedGraphNet(hk.Module):
     latent_graph = latent_graph_0
     for unused_repetition_i in range(self._num_processor_repetitions):
       for processor_network in processor_networks:
-        latent_graph = self._process_step(processor_network, latent_graph)
+        latent_graph = self._process_step(processor_network, latent_graph, global_norm_conditioning)
 
     return latent_graph
 
   def _process_step(
       self, processor_network_k,
-      latent_graph_prev_k: typed_graph.TypedGraph) -> typed_graph.TypedGraph:
+      latent_graph_prev_k: typed_graph.TypedGraph,
+      global_norm_conditioning: Optional[chex.Array] = None
+  ) -> typed_graph.TypedGraph:
     """Single step of message passing with node/edge residual connections."""
 
     # One step of message passing.
-    latent_graph_k = processor_network_k(latent_graph_prev_k)
+    latent_graph_k = processor_network_k(latent_graph_prev_k, global_norm_conditioning)
 
     # Add residuals.
     nodes_with_residuals = {}
@@ -403,7 +415,17 @@ class DeepTypedGraphNet(hk.Module):
 
 
 def _build_update_fns_for_node_types(
-    builder_fn, graph_template, prefix, output_sizes=None):
+    *,
+    builder_fn, 
+    graph_template, 
+    mlp_hidden_size,
+    mlp_num_hidden_layers,
+    activation,
+    use_layer_norm,
+    use_norm_conditioning,
+    rngs,
+    input_sizes=None,
+    output_sizes=None):
   """Builds an update function for all node types or a subset of them."""
 
   output_fns = {}
@@ -417,13 +439,35 @@ def _build_update_fns_for_node_types(
         output_size = output_sizes[node_set_name]
       else:
         continue
+    
+    if input_sizes is None:
+      input_size = graph_template.nodes[node_set_name].features.shape[-1]
+
     output_fns[node_set_name] = builder_fn(
-        f"{prefix}{node_set_name}", output_size)
+      mlp_input_size=input_size,
+      mlp_hidden_size=mlp_hidden_size,
+      mlp_num_hidden_layers=mlp_num_hidden_layers,
+      mlp_output_size=output_size,
+      activation=activation,
+      use_layer_norm=use_layer_norm,
+      use_norm_conditioning=use_norm_conditioning,
+      rngs=rngs)
   return output_fns
 
 
 def _build_update_fns_for_edge_types(
-    builder_fn, graph_template, prefix, output_sizes=None):
+    *,
+    builder_fn, 
+    graph_template,
+    mlp_hidden_size,
+    mlp_num_hidden_layers,
+    activation,
+    use_layer_norm,
+    use_norm_conditioning,
+    rngs,
+    input_sizes=None,
+    output_sizes = None
+    ):
   """Builds an edge function for all node types or a subset of them."""
   output_fns = {}
   for edge_set_key in graph_template.edges.keys():
@@ -437,8 +481,19 @@ def _build_update_fns_for_edge_types(
         output_size = output_sizes[edge_set_name]
       else:
         continue
+
+    if input_sizes is None:
+      input_size = graph_template.edges[edge_set_key].features.shape[-1]
+
     output_fns[edge_set_name] = builder_fn(
-        f"{prefix}{edge_set_name}", output_size)
+        mlp_input_size=input_size,
+        mlp_hidden_size=mlp_hidden_size,
+        mlp_num_hidden_layers=mlp_num_hidden_layers,
+        mlp_output_size=output_size,
+        activation=activation,
+        use_layer_norm=use_layer_norm,
+        use_norm_conditioning=use_norm_conditioning,
+        rngs=rngs)
   return output_fns
 
 
@@ -446,6 +501,8 @@ def _get_activation_fn(name):
   """Return activation function corresponding to function_name."""
   if name == "identity":
     return lambda x: x
+  if hasattr(nnx, name):
+    return getattr(nnx, name)
   if hasattr(jax.nn, name):
     return getattr(jax.nn, name)
   if hasattr(jnp, name):

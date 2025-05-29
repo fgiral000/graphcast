@@ -35,8 +35,8 @@ class LinearNormConditioning(nnx.Module):
   def __init__(self, feature_size: int, rngs: nnx.Rngs):
     self.feature_size = feature_size
     self.conditional_linear_layer = nnx.Linear(
-      input_size=self.feature_size,
-      output_size=2 * self.feature_size,
+      in_features=self.feature_size,
+      out_features=2 * self.feature_size,
       kernel_init=nnx.initializers.truncated_normal(stddev=1e-8),
       rngs=rngs,
     )
@@ -48,81 +48,130 @@ class LinearNormConditioning(nnx.Module):
     return inputs * scale + offset
   
 
+
+class MLP(nnx.Module): 
+  """A simple MLP module."""
+  def __init__(self,
+               mlp_input_size: int,
+               mlp_hidden_size: int,
+               mlp_num_hidden_layers: int,
+               mlp_output_size: int,
+               activation,
+               *,
+               rngs: nnx.Rngs):
+    """Initializes the MLP module."""
+    layers = []
+    feature_size = mlp_input_size
+    for _ in range(mlp_num_hidden_layers):
+      layers.append(nnx.Linear(feature_size, mlp_hidden_size, rngs=rngs))
+      feature_size = mlp_hidden_size
+      layers.append(activation)
+    layers.append(nnx.Linear(mlp_hidden_size, mlp_output_size, rngs=rngs))
+    self.network = nnx.Sequential(*layers)
+  
+  def __call__(self, inputs: jax.Array):
+    return self.network(inputs)
+
+
+class MLPWithNormConditioning(nnx.Module):
+  """An MLP module with norm conditioning."""
+  def __init__(self,
+               mlp_input_size: int,
+               mlp_hidden_size: int,
+               mlp_num_hidden_layers: int,
+               mlp_output_size: int,
+               activation,
+               *,
+               use_layer_norm: bool,
+               use_norm_conditioning: bool,
+               rngs: nnx.Rngs):
+    """Initializes the MLP with norm conditioning."""
+    
+    self._use_layer_norm = use_layer_norm
+    self._use_norm_conditioning = use_norm_conditioning
+
+    self.network = MLP(
+        mlp_input_size=mlp_input_size,
+        mlp_hidden_size=mlp_hidden_size,
+        mlp_num_hidden_layers=mlp_num_hidden_layers,
+        mlp_output_size=mlp_output_size,
+        activation=activation,
+        rngs=rngs,
+    )
+
+    if self._use_norm_conditioning:
+      # If using norm conditioning, it is no longer the responsibility of the
+      # LayerNorm module itself to learn its scale and offset. These will be
+      # learned for the module by the norm conditioning layer instead.
+      create_scale = create_offset = False
+    else:
+      create_scale = create_offset = True
+
+    if self._use_layer_norm:
+      self.layer_norm = nnx.LayerNorm(num_features=mlp_output_size,
+                                use_scale=create_scale,
+                                use_bias=create_offset,
+                                feature_axes=-1,
+                                rngs=rngs)
+
+    if self._use_norm_conditioning:
+      self.norm_conditioning_layer = LinearNormConditioning(feature_size=mlp_output_size,
+                                                      rngs=rngs)
+
+  
+  def __call__(self, inputs: jax.Array, global_norm_conditioning: Optional[jax.Array] = None):
+
+    if self._use_norm_conditioning:
+      if global_norm_conditioning is None:
+        raise ValueError(
+            "When using norm conditioning, `global_norm_conditioning` must"
+            "be passed to the call method.")
+    else:
+      if global_norm_conditioning is not None:
+        raise ValueError(
+            "`globa_norm_conditioning` was passed, but `norm_conditioning`"
+            " is not enabled.")
+
+    x = self.network(inputs)
+    if self._use_layer_norm:
+      x = self.layer_norm(x)
+      if self._use_norm_conditioning:
+        #broadcast the global norm conditioning to match the batch size
+        global_norm_conditioning = global_norm_conditioning[None]
+        x = self.norm_conditioning_layer(x, global_norm_conditioning)
+
+    return x
+
+
+    
     
 
-def build_mlp(mlp_input_size, 
-              mlp_hidden_size, 
-              mlp_num_hidden_layers,
-              mlp_output_size, 
-              activation,
-              *,
-              rngs: nnx.Rngs,): 
-  layers = []
-  feature_size = mlp_input_size
-  for _ in range(mlp_num_hidden_layers):
-    layers.append(nnx.Linear(feature_size, mlp_hidden_size, rngs=rngs))
-    feature_size = mlp_hidden_size
-    layers.append(activation)
-  layers.append(nnx.Linear(mlp_hidden_size, mlp_output_size, rngs=rngs))
-  return jraph.concatenated_args(nnx.Sequential(*layers))
 
 
 
-def build_mlp_with_maybe_layer_norm( mlp_input_size: int,
-    mlp_hidden_size: int,
-    mlp_num_hidden_layers: int,
-    mlp_output_size: int,
-    activation,
-    *,
-    use_layer_norm: bool,
-    use_norm_conditioning: bool,
-    global_norm_conditioning: Optional[jax.Array] = None,
-    rngs: nnx.Rngs,
-):
-  """Builds an MLP, optionally with LayerNorm and norm-conditioning."""
-  network = build_mlp(
-      mlp_input_size=mlp_input_size,
-      mlp_hidden_size=mlp_hidden_size,
-      mlp_num_hidden_layers=mlp_num_hidden_layers,
-      mlp_output_size=mlp_output_size,
-      activation=activation,
-      rngs=rngs,
+if __name__ == "__main__":
+  # Example usage
+  rngs = nnx.Rngs(0)
+
+  mlp = MLPWithNormConditioning(
+      mlp_input_size=10,
+      mlp_hidden_size=20,
+      mlp_num_hidden_layers=3,
+      mlp_output_size=5,
+      activation=nnx.relu,
+      use_layer_norm=True,
+      use_norm_conditioning=True,
+      rngs=rngs
   )
-  # If one if used, the other cannot be used.
-  assert not (use_layer_norm and use_norm_conditioning), (
-      "Cannot use both `use_layer_norm` and `use_norm_conditioning` at the same"
-      " time. Please choose one of them.")
+  # Visualize the model architecture
+  # nnx.display(mlp)
+  # This will print the structure of the MLP.
+
+  # Let's use some dummy data to test the MLP
+  dummy_input = jnp.ones((1,10))  # Batch size of 1, input size of 10
+  global_norm_conditioning = jnp.ones((5,))  # Example global norm conditioning
   
-  stages = [network]
-  if use_norm_conditioning:
-    if global_norm_conditioning is None:
-      raise ValueError(
-          "When using norm conditioning, `global_norm_conditioning` must"
-          "be passed to the call method.")
-    # If using norm conditioning, it is no longer the responsibility of the
-    # LayerNorm module itself to learn its scale and offset. These will be
-    # learned for the module by the norm conditioning layer instead.
-  else:
-    if global_norm_conditioning is not None:
-      raise ValueError(
-          "`globa_norm_conditioning` was passed, but `norm_conditioning`"
-          " is not enabled.")
 
-  if use_layer_norm:
-    layer_norm = nnx.LayerNorm(num_features=mlp_output_size,
-                               feature_axes=-1,
-                               rngs=rngs)
-    stages.append(layer_norm)
 
-  if use_norm_conditioning:
-    norm_conditioning_layer = LinearNormConditioning(feature_size=mlp_output_size,
-                                                     rngs=rngs)
-    norm_conditioning_layer = functools.partial(
-        norm_conditioning_layer,
-        # Broadcast to the node/edge axis.
-        norm_conditioning=global_norm_conditioning[None],
-    )
-    stages.append(norm_conditioning_layer)
-
-  network = nnx.Sequential(*stages)
-  return jraph.concatenated_args(network)
+  output = mlp(dummy_input, global_norm_conditioning=global_norm_conditioning)
+  print("Output shape:", output.shape)  # Should be (1, 5) for the output size of 5

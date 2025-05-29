@@ -1,6 +1,6 @@
 # Google DeepMind GenCast -- Flax NNX reimplementation
 
-This is a reimplementation of **DeepMind's Gencast model** using the new Flax API: NNX, instead of the Haiku library.
+This is a reimplementation of **DeepMind's Gencast model** using the new [Flax](https://github.com/google/flax) API: NNX, instead of the Haiku library.
 
 NOTE: Work in progress...
 
