@@ -442,6 +442,8 @@ def _build_update_fns_for_node_types(
     
     if input_sizes is None:
       input_size = graph_template.nodes[node_set_name].features.shape[-1]
+    else:
+      input_size = input_sizes[node_set_name]
 
     output_fns[node_set_name] = builder_fn(
       mlp_input_size=input_size,
@@ -484,6 +486,8 @@ def _build_update_fns_for_edge_types(
 
     if input_sizes is None:
       input_size = graph_template.edges[edge_set_key].features.shape[-1]
+    else:
+      input_size = input_sizes[edge_set_key]
 
     output_fns[edge_set_name] = builder_fn(
         mlp_input_size=input_size,
