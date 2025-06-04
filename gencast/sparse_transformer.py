@@ -460,80 +460,77 @@ class SplashMHA(nnx.Module):
     return x
 
 
-
-
-class Block(hk.Module):
+class Block(nnx.Module):
   """Transformer block (mha and ffw)."""
 
-  def __init__(self, cfg, mask, num_nodes, num_padding_nodes, name=None):
-    super().__init__(name=name)
+  def __init__(self, cfg: _ModelConfig, mask: jnp.ndarray, num_nodes: int,
+               num_padding_nodes: Tuple[int, int] | int, *, rngs: nnx.Rngs):
     self._cfg = cfg
     self.mask = mask
     self.num_nodes = num_nodes
     self.num_padding_nodes = num_padding_nodes
 
-  def __call__(self, x, global_norm_conditioning=jax.Array):
+    # Instantiate attention and FFW modules in __init__
+    if self._cfg.attention_type == 'triblockdiag_mha':
+      self.attn_module = TriblockdiagMHA(cfg, rngs=rngs)
+    elif self._cfg.attention_type == 'mha':
+      self.attn_module = MHA(cfg, rngs=rngs)
+    elif self._cfg.attention_type == 'splash_mha':
+      self.attn_module = SplashMHA(cfg, rngs=rngs)
+    else:
+      raise NotImplementedError()
+
+    self.ffw_module = FeedForward(cfg, rngs=rngs)
+
+    # Instantiate LinearNormConditioning and LayerNorm
+    self.norm_cond_attn = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs)
+    self.norm_cond_ffw = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs)
+    self.ln1 = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+    self.ln2 = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+
+
+  def __call__(self, x: jnp.ndarray, global_norm_conditioning: jax.Array):
     # x shape is (batch, num_nodes, feature_dim)
-    def attn(x):
+    def call_attn(x_in):
       if self._cfg.attention_type == 'triblockdiag_mha':
         # We pad -> reshape -> compute attn -> reshape -> select at each block
         # so as to avoid complications involved in making the norm layers and
         # ffw blocks account for the padding. However, this might be decreasing
         # efficiency.
-
-        # Add padding so that number of nodes is divisible into blocks
-        x = jnp.pad(x, ((0, 0), (0, self.num_padding_nodes), (0, 0)))
-        x = x.reshape(x.shape[0],
-                      x.shape[1]//self._cfg.mask_block_size,
-                      self._cfg.mask_block_size,
-                      x.shape[-1])
-        x = triblockdiag_mha(x, x, mask=self.mask, cfg=self._cfg)
-        x = x.reshape(x.shape[0],
-                      self.num_nodes + self.num_padding_nodes,
-                      x.shape[-1])
-        return x[:,:self.num_nodes, :]
+        x_padded = jnp.pad(x_in, ((0, 0), (0, self.num_padding_nodes), (0, 0)))
+        x_reshaped = x_padded.reshape(x_padded.shape[0],
+                                      x_padded.shape[1]//self._cfg.mask_block_size,
+                                      self._cfg.mask_block_size,
+                                      x_padded.shape[-1])
+        x_attn = self.attn_module(x_reshaped, x_reshaped, mask=self.mask)
+        x_attn_reshaped = x_attn.reshape(x_attn.shape[0],
+                                          self.num_nodes + self.num_padding_nodes,
+                                          x_attn.shape[-1])
+        return x_attn_reshaped[:,:self.num_nodes, :]
 
       elif self._cfg.attention_type == 'mha':
-        return mha(x, x, mask=self.mask, cfg=self._cfg)
+        return self.attn_module(x_in, x_in, mask=self.mask)
 
       elif self._cfg.attention_type == 'splash_mha':
-        # We pad -> reshape -> compute attn -> reshape -> select at each block
-        # so as to avoid complications involved in making the norm layers and
-        # ffw blocks account for the padding. However, this might be decreasing
-        # efficiency.
-
         # Add padding so that number of nodes is divisible by block sizes.
-        x = jnp.pad(x, ((0, 0), (0, self.num_padding_nodes[0]), (0, 0)))
-        x = splash_mha(x, x, mask=self.mask, cfg=self._cfg)
-        return x[:,:self.num_nodes, :]
+        x_padded = jnp.pad(x_in, ((0, 0), (0, self.num_padding_nodes[0]), (0, 0)))
+        x_attn = self.attn_module(x_padded, x_padded, mask=self.mask)
+        return x_attn[:,:self.num_nodes, :]
 
       else:
         raise NotImplementedError()
 
-    def norm_conditioning_layer(x):
-      return mlp_builder.LinearNormConditioning(
-          name=self.name+'_norm_conditioning')(
-              x,
-              norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1)
-              )
+    normed_x_attn = self.ln1(x)
+    conditioned_x_attn = self.norm_cond_attn(normed_x_attn, norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1))
+    x = x + call_attn(conditioned_x_attn)
 
-    x = x + attn(
-        norm_conditioning_layer(
-            layernorm(x, create_scale=False, create_offset=False)
-        )
-    )
-    x = x + ffw(
-        norm_conditioning_layer(
-            layernorm(x, create_scale=False, create_offset=False)
-        ),
-        self._cfg,
-    )
+    normed_x_ffw = self.ln2(x)
+    conditioned_x_ffw = self.norm_cond_ffw(normed_x_ffw, norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1))
+    x = x + self.ffw_module(conditioned_x_ffw)
     return x
 
 
-
-
-class Transformer(hk.Module):
+class Transformer(nnx.Module):
   """Main transformer module that processes embeddings.
 
   All but the very first and very last layer of a 'classic' Transformer:
@@ -546,8 +543,9 @@ class Transformer(hk.Module):
                attention_k_hop: int,
                attention_type: Literal['splash_mha', 'triblockdiag_mha', 'mha'],
                mask_type: Literal['full', 'lazy'],
-               num_heads=1,
-               name=None,
+               num_heads: int = 1,
+               *,
+               rngs: nnx.Rngs,
                block_q: Optional[int] = None,
                block_kv: Optional[int] = None,
                block_kv_compute: Optional[int] = None,
@@ -555,7 +553,6 @@ class Transformer(hk.Module):
                block_kv_dkv: Optional[int] = None,
                block_kv_dkv_compute: Optional[int] = None,
                **kwargs):
-    super().__init__(name=name)
 
     # Construct mask and deduce block size.
     mask = adj_mat ** attention_k_hop
@@ -610,24 +607,31 @@ class Transformer(hk.Module):
         block_kv_dkv_compute=block_kv_dkv_compute,
         **kwargs)
 
-  def __call__(self, node_features, global_norm_conditioning: jax.Array):
+    # Instantiate all Block modules
+    self.blocks = []
+    for _ in range(self._cfg.num_layers):
+      self.blocks.append(
+          Block(cfg=self._cfg, 
+                mask=self.mask,
+                num_nodes=adj_mat.shape[0], # Pass actual num_nodes from adj_mat
+                num_padding_nodes=self.num_padding_nodes,
+                rngs=rngs # Pass rngs to sub-modules
+                )
+      )
+
+    # Final LayerNorm and LinearNormConditioning
+    self.final_ln = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+    self.final_norm_cond = mlp_builder.LinearNormConditioning(
+        feature_size=self._cfg.d_model, rngs=rngs)
+
+  def __call__(self, node_features: jnp.ndarray, global_norm_conditioning: jax.Array):
     # node_features expected to have shape (batch, num_nodes, d)
     x = node_features
-    for i_layer in range(self._cfg.num_layers):
-      x = Block(cfg=self._cfg, mask=self.mask,
-                num_nodes=node_features.shape[1],
-                num_padding_nodes=self.num_padding_nodes,
-                name='block_%02d' % i_layer
-                )(x, global_norm_conditioning=global_norm_conditioning)
+    for block in self.blocks:
+      x = block(x, global_norm_conditioning=global_norm_conditioning)
 
-    def norm_conditioning_layer(x):
-      return mlp_builder.LinearNormConditioning(
-          name=self.name+'_final_norm_conditioning')(
-              x,
-              norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1)
-              )
-    x = norm_conditioning_layer(
-        layernorm(x, create_scale=False, create_offset=False)
+    x = self.final_norm_cond(
+        self.final_ln(x),
+        norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1)
     )
-
     return x
