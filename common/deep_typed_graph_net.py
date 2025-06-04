@@ -34,11 +34,13 @@ Generalization to TypedGraphs of the deep Graph Neural Network from:
 }
 """
 
+from __future__ import annotations
+
 import functools
-from typing import Callable, List, Mapping, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple, Type
 
 import chex
-from common import mlp as mlp_builder
+from common import mlp as mlp_builder 
 from common import typed_graph
 from common import typed_graph_net
 
@@ -49,7 +51,114 @@ import jax.numpy as jnp
 import jraph
 
 
-GraphToGraphNetwork = Callable[[typed_graph.TypedGraph], typed_graph.TypedGraph]
+GraphToGraphNetwork = Callable[[typed_graph.TypedGraph, Optional[chex.Array]], typed_graph.TypedGraph]
+
+############################################### Helper Functions ###############################################
+def _get_activation_fn(name):
+  """Return activation function corresponding to function_name."""
+  if name == "identity":
+    return lambda x: x
+  if hasattr(nnx, name):
+    return getattr(nnx, name)
+  if hasattr(jax.nn, name):
+    return getattr(jax.nn, name)
+  if hasattr(jnp, name):
+    return getattr(jnp, name)
+  raise ValueError(f"Unknown activation function {name} specified.")
+
+
+def _get_aggregate_edges_for_nodes_fn(name):
+  """Return aggregate_edges_for_nodes_fn corresponding to function_name."""
+  if hasattr(jraph, name):
+    return getattr(jraph, name)
+  raise ValueError(
+      f"Unknown aggregate_edges_for_nodes_fn function {name} specified.")
+
+
+def _build_update_fns_for_node_types(
+    *,
+    builder_fn: Type[nnx.Module],
+    graph_template: typed_graph.TypedGraph,
+    mlp_hidden_size: int,
+    mlp_num_hidden_layers: int,
+    activation: Callable[[jnp.ndarray], jnp.ndarray],
+    use_layer_norm: bool,
+    use_norm_conditioning: bool,
+    rngs: nnx.Rngs,
+    input_sizes: Optional[Mapping[str, int]] = None,
+    output_sizes: Optional[Mapping[str, int]] = None
+) -> Mapping[str, nnx.Module]: # Returns a dict of instantiated NNX modules
+  """Builds an update function for all node types or a subset of them."""
+  output_fns = {}
+  for node_set_name in graph_template.nodes.keys():
+    output_size = None
+    if output_sizes is not None:
+      if node_set_name in output_sizes:
+        output_size = output_sizes[node_set_name]
+      else:
+        continue # Skip if no explicit output size and output_sizes is provided
+
+    current_input_size = None
+    if input_sizes is None:
+      current_input_size = graph_template.nodes[node_set_name].features.shape[-1]
+    else:
+      current_input_size = input_sizes[node_set_name]
+
+    output_fns[node_set_name] = builder_fn(
+      mlp_input_size=current_input_size,
+      mlp_hidden_size=mlp_hidden_size,
+      mlp_num_hidden_layers=mlp_num_hidden_layers,
+      mlp_output_size=output_size,
+      activation=activation,
+      use_layer_norm=use_layer_norm,
+      use_norm_conditioning=use_norm_conditioning,
+      rngs=rngs,
+    )
+  return output_fns
+
+
+def _build_update_fns_for_edge_types(
+    *,
+    builder_fn: Type[nnx.Module],
+    graph_template: typed_graph.TypedGraph,
+    mlp_hidden_size: int,
+    mlp_num_hidden_layers: int,
+    activation: Callable[[jnp.ndarray], jnp.ndarray],
+    use_layer_norm: bool,
+    use_norm_conditioning: bool,
+    rngs: nnx.Rngs,
+    input_sizes: Optional[Mapping[typed_graph.EdgeSetKey, int]] = None,
+    output_sizes: Optional[Mapping[str, int]] = None
+) -> Mapping[str, nnx.Module]: # Returns a dict of instantiated NNX modules
+  """Builds an edge function for all edge types or a subset of them."""
+  output_fns = {}
+  for edge_set_key in graph_template.edges.keys():
+    edge_set_name = edge_set_key.name
+    output_size = None
+    if output_sizes is not None:
+      if edge_set_name in output_sizes:
+        output_size = output_sizes[edge_set_name]
+      else:
+        continue # Skip if no explicit output size and output_sizes is provided
+
+    current_input_size = None
+    if input_sizes is None:
+      current_input_size = graph_template.edges[edge_set_key].features.shape[-1]
+    else:
+      # Note: input_sizes for edges are typically keyed by EdgeSetKey, not just name string
+      current_input_size = input_sizes[edge_set_name]
+
+    output_fns[edge_set_name] = builder_fn(
+        mlp_input_size=current_input_size,
+        mlp_hidden_size=mlp_hidden_size,
+        mlp_num_hidden_layers=mlp_num_hidden_layers,
+        mlp_output_size=output_size,
+        activation=activation,
+        use_layer_norm=use_layer_norm,
+        use_norm_conditioning=use_norm_conditioning,
+        rngs=rngs,
+    )
+  return output_fns
 
 
 class DeepTypedGraphNet(nnx.Module):
@@ -85,7 +194,6 @@ class DeepTypedGraphNet(nnx.Module):
 
   def __init__(self,
                *,
-               graph_template: typed_graph.TypedGraph,
                node_latent_size: Mapping[str, int],
                edge_latent_size: Mapping[str, int],
                mlp_hidden_size: int,
@@ -151,7 +259,9 @@ class DeepTypedGraphNet(nnx.Module):
         segment_mean.
       name: Name of the model.
     """
-    self._graph_template = graph_template
+    super().__init__(name=name)
+
+    # Store all parameters except graph_template
     self._node_latent_size = node_latent_size
     self._edge_latent_size = edge_latent_size
     self._mlp_hidden_size = mlp_hidden_size
@@ -176,75 +286,51 @@ class DeepTypedGraphNet(nnx.Module):
     self._aggregate_edges_for_nodes_fn = _get_aggregate_edges_for_nodes_fn(
         aggregate_edges_for_nodes_fn)
     self._aggregate_normalization = aggregate_normalization
-    self._name = name
-    self._rngs = rngs
+    self._rngs = rngs # Store the RNGs for lazy initialization
 
     if aggregate_normalization:
-      # using aggregate_normalization only makes sense with segment_sum.
       assert aggregate_edges_for_nodes_fn == "segment_sum"
 
-    # Build the networks
-    self.embedder_network, self.processor_networks, self.decoder_network = (
-        self._networks_builder(graph_template=self._graph_template)
-    )
+    # Initialize modules to None; they'll be built on the first __call__
+    self.embedder_network: Optional[typed_graph_net.GraphMapFeatures] = None
+    self.processor_networks: Optional[List[typed_graph_net.InteractionNetwork]] = None
+    self.decoder_network: Optional[typed_graph_net.GraphMapFeatures] = None
 
-  def __call__(self,
-               input_graph: typed_graph.TypedGraph,
-               global_norm_conditioning: Optional[chex.Array] = None
-               ) -> typed_graph.TypedGraph:
-    """Forward pass of the learnable dynamics model."""
-    # Embed input features (if applicable).
-    latent_graph_0 = self._embed(input_graph, self.embedder_network, global_norm_conditioning)
-
-    # Do `m` message passing steps in the latent graphs.
-    latent_graph_m = self._process(latent_graph_0, self.processor_networks, global_norm_conditioning)
-
-    # Compute outputs from the last latent graph (if applicable).
-    return self._output(latent_graph_m, self.decoder_network)
-
-  def _networks_builder(
-      self,
-      graph_template: typed_graph.TypedGraph,
-  ) -> Tuple[
-      GraphToGraphNetwork, List[GraphToGraphNetwork], GraphToGraphNetwork
-  ]:
-
+  def _initialize_networks(self, graph_template: typed_graph.TypedGraph):
+    """Initializes all sub-networks using the provided graph_template."""
     # The embedder graph network independently embeds edge and node features.
+    embed_edge_fn = None
     if self._embed_edges:
       embed_edge_fn = _build_update_fns_for_edge_types(
           builder_fn=mlp_builder.MLPWithNormConditioning,
           graph_template=graph_template,
           mlp_hidden_size=self._mlp_hidden_size,
-          mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+          mlp_num_hidden_layers=self._mlp_num_hidden_layers,
           activation=self._activation,
           use_layer_norm=self._use_layer_norm,
           use_norm_conditioning=self._use_norm_conditioning,
           rngs=self._rngs,
-          input_sizes=None,
+          input_sizes=None, # Inferred from graph_template
           output_sizes=self._edge_latent_size)
-    else:
-      embed_edge_fn = None
+
+    embed_node_fn = None
     if self._embed_nodes:
       embed_node_fn = _build_update_fns_for_node_types(
           builder_fn=mlp_builder.MLPWithNormConditioning,
           graph_template=graph_template,
           mlp_hidden_size=self._mlp_hidden_size,
-          mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+          mlp_num_hidden_layers=self._mlp_num_hidden_layers,
           activation=self._activation,
           use_layer_norm=self._use_layer_norm,
           use_norm_conditioning=self._use_norm_conditioning,
           rngs=self._rngs,
-          input_sizes=None,
+          input_sizes=None, # Inferred from graph_template
           output_sizes=self._node_latent_size)
-    else:
-      embed_node_fn = None
-    
-    embedder_kwargs = dict(
+
+    self.embedder_network = typed_graph_net.GraphMapFeatures(
         embed_edge_fn=embed_edge_fn,
         embed_node_fn=embed_node_fn,
     )
-    embedder_network = typed_graph_net.GraphMapFeatures(
-        **embedder_kwargs)
 
     if self._f32_aggregation:
       def aggregate_fn(data, *args, **kwargs):
@@ -255,7 +341,6 @@ class DeepTypedGraphNet(nnx.Module):
           output = output / self._aggregate_normalization
         output = output.astype(dtype)
         return output
-
     else:
       def aggregate_fn(data, *args, **kwargs):
         output = self._aggregate_edges_for_nodes_fn(data, *args, **kwargs)
@@ -265,75 +350,98 @@ class DeepTypedGraphNet(nnx.Module):
 
     # Create `num_message_passing_steps` graph networks with unshared parameters
     # that update the node and edge latent features.
-    # Note that we can use `modules.InteractionNetwork` because
-    # it also outputs the messages as updated edge latent features.
-    processor_networks = []
-    for step_i in range(self._num_message_passing_steps):
-      processor_networks.append(
+    self.processor_networks = []
+    for _ in range(self._num_message_passing_steps):
+      self.processor_networks.append(
           typed_graph_net.InteractionNetwork(
               update_edge_fn=_build_update_fns_for_edge_types(
                   builder_fn=mlp_builder.MLPWithNormConditioning,
                   graph_template=graph_template,
                   mlp_hidden_size=self._mlp_hidden_size,
-                  mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+                  mlp_num_hidden_layers=self._mlp_num_hidden_layers,
                   activation=self._activation,
                   use_layer_norm=self._use_layer_norm,
                   use_norm_conditioning=self._use_norm_conditioning,
                   rngs=self._rngs,
-                  input_sizes=None,
+                  input_sizes=self._edge_latent_size,
                   output_sizes=self._edge_latent_size),
               update_node_fn=_build_update_fns_for_node_types(
                   builder_fn=mlp_builder.MLPWithNormConditioning,
                   graph_template=graph_template,
                   mlp_hidden_size=self._mlp_hidden_size,
-                  mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+                  mlp_num_hidden_layers=self._mlp_num_hidden_layers,
                   activation=self._activation,
                   use_layer_norm=self._use_layer_norm,
                   use_norm_conditioning=self._use_norm_conditioning,
-                  rngs=self._rngs,
-                  input_sizes=None,
+                  rngs=self._rngs, 
+                  input_sizes=self._node_latent_size,
                   output_sizes=self._node_latent_size),
               aggregate_edges_for_nodes_fn=aggregate_fn,
               include_sent_messages_in_node_update=(
                   self._include_sent_messages_in_node_update),
-              ))
+              )
+      )
 
     # The output MLPs converts edge/node latent features into the output sizes.
-    output_kwargs = dict(
-        embed_edge_fn=_build_update_fns_for_edge_types(
+    output_edge_fn = None
+    if self._edge_output_size:
+        output_edge_fn = _build_update_fns_for_edge_types(
             builder_fn=mlp_builder.MLPWithNormConditioning,
-            graph_template=graph_template, 
+            graph_template=graph_template,
             mlp_hidden_size=self._mlp_hidden_size,
-            mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+            mlp_num_hidden_layers=self._mlp_num_hidden_layers,
             activation=self._activation,
-            use_layer_norm=False,
-            use_norm_conditioning=False,
-            rngs=self._rngs,
-            input_sizes=None,
-            output_sizes=self._edge_output_size)
-        if self._edge_output_size else None,
-        embed_node_fn=_build_update_fns_for_node_types(
-            builder_fn=mlp_builder.MLPWithNormConditioning, 
-            graph_template=graph_template, 
+            use_layer_norm=False, # Output MLPs usually don't have layer norm
+            use_norm_conditioning=False, # Output MLPs usually don't have conditioning
+            rngs=self._rngs, 
+            input_sizes=self._edge_latent_size,
+            output_sizes=self._edge_output_size
+        )
+    output_node_fn = None
+    if self._node_output_size:
+        output_node_fn = _build_update_fns_for_node_types(
+            builder_fn=mlp_builder.MLPWithNormConditioning,
+            graph_template=graph_template,
             mlp_hidden_size=self._mlp_hidden_size,
-            mlp_num_hidden_layer=self._mlp_num_hidden_layers,
+            mlp_num_hidden_layers=self._mlp_num_hidden_layers,
             activation=self._activation,
-            use_layer_norm=False,
-            use_norm_conditioning=False,
-            rngs=self._rngs,
-            input_sizes=None, 
-            output_sizes=self._node_output_size)
-        if self._node_output_size else None,)
-    
-    output_network = typed_graph_net.GraphMapFeatures(
-        **output_kwargs)
-    
-    return embedder_network, processor_networks, output_network
+            use_layer_norm=False, # Output MLPs usually don't have layer norm
+            use_norm_conditioning=False, # Output MLPs usually don't have conditioning
+            rngs=self._rngs, # Use derived RNGs
+            input_sizes=self._node_latent_size,
+            output_sizes=self._node_output_size
+        )
+
+    self.decoder_network = typed_graph_net.GraphMapFeatures(
+        embed_edge_fn=output_edge_fn,
+        embed_node_fn=output_node_fn,
+    )
+
+
+  def __call__(self,
+               input_graph: typed_graph.TypedGraph,
+               global_norm_conditioning: Optional[chex.Array] = None
+               ) -> typed_graph.TypedGraph:
+    """Forward pass of the learnable dynamics model."""
+
+    # Lazily initialize networks on the first call
+    if self.embedder_network is None: # Check any of the networks
+      self._initialize_networks(input_graph)
+
+
+    # Embed input features (if applicable).
+    latent_graph_0 = self._embed(input_graph, self.embedder_network, global_norm_conditioning)
+
+    # Do `m` message passing steps in the latent graphs.
+    latent_graph_m = self._process(latent_graph_0, self.processor_networks, global_norm_conditioning)
+
+    # Compute outputs from the last latent graph (if applicable).
+    return self._output(latent_graph_m, self.decoder_network)
 
   def _embed(
       self,
       input_graph: typed_graph.TypedGraph,
-      embedder_network: GraphToGraphNetwork,
+      embedder_network: typed_graph_net.GraphMapFeatures, # Type hint for clarity
       global_norm_conditioning: Optional[chex.Array] = None
   ) -> typed_graph.TypedGraph:
     """Embeds the input graph features into a latent graph."""
@@ -358,21 +466,18 @@ class DeepTypedGraphNet(nnx.Module):
           context=input_graph.context._replace(features=()))
 
     # Embeds the node and edge features.
-    latent_graph_0 = embedder_network(input_graph, 
+    latent_graph_0 = embedder_network(input_graph,
                                       global_norm_conditioning)
     return latent_graph_0
 
   def _process(
       self,
       latent_graph_0: typed_graph.TypedGraph,
-      processor_networks: List[GraphToGraphNetwork],
+      processor_networks: List[typed_graph_net.InteractionNetwork], # Type hint for clarity
       global_norm_conditioning: Optional[chex.Array] = None
   ) -> typed_graph.TypedGraph:
     """Processes the latent graph with several steps of message passing."""
 
-    # Do `num_message_passing_steps` with each of the `self._processor_networks`
-    # with unshared weights, and repeat that `self._num_processor_repetitions`
-    # times.
     latent_graph = latent_graph_0
     for unused_repetition_i in range(self._num_processor_repetitions):
       for processor_network in processor_networks:
@@ -381,16 +486,14 @@ class DeepTypedGraphNet(nnx.Module):
     return latent_graph
 
   def _process_step(
-      self, processor_network_k,
+      self, processor_network_k: typed_graph_net.InteractionNetwork, # Type hint for clarity
       latent_graph_prev_k: typed_graph.TypedGraph,
       global_norm_conditioning: Optional[chex.Array] = None
   ) -> typed_graph.TypedGraph:
     """Single step of message passing with node/edge residual connections."""
 
-    # One step of message passing.
     latent_graph_k = processor_network_k(latent_graph_prev_k, global_norm_conditioning)
 
-    # Add residuals.
     nodes_with_residuals = {}
     for k, prev_set in latent_graph_prev_k.nodes.items():
       nodes_with_residuals[k] = prev_set._replace(
@@ -408,115 +511,7 @@ class DeepTypedGraphNet(nnx.Module):
   def _output(
       self,
       latent_graph: typed_graph.TypedGraph,
-      output_network: GraphToGraphNetwork,
+      output_network: typed_graph_net.GraphMapFeatures, # Type hint for clarity
   ) -> typed_graph.TypedGraph:
     """Produces the output from the latent graph."""
     return output_network(latent_graph)
-
-
-def _build_update_fns_for_node_types(
-    *,
-    builder_fn, 
-    graph_template, 
-    mlp_hidden_size,
-    mlp_num_hidden_layers,
-    activation,
-    use_layer_norm,
-    use_norm_conditioning,
-    rngs,
-    input_sizes=None,
-    output_sizes=None):
-  """Builds an update function for all node types or a subset of them."""
-
-  output_fns = {}
-  for node_set_name in graph_template.nodes.keys():
-    if output_sizes is None:
-      # Use the default output size for all types.
-      output_size = None
-    else:
-      # Otherwise, ignore any type that does not have an explicit output size.
-      if node_set_name in output_sizes:
-        output_size = output_sizes[node_set_name]
-      else:
-        continue
-    
-    if input_sizes is None:
-      input_size = graph_template.nodes[node_set_name].features.shape[-1]
-    else:
-      input_size = input_sizes[node_set_name]
-
-    output_fns[node_set_name] = builder_fn(
-      mlp_input_size=input_size,
-      mlp_hidden_size=mlp_hidden_size,
-      mlp_num_hidden_layers=mlp_num_hidden_layers,
-      mlp_output_size=output_size,
-      activation=activation,
-      use_layer_norm=use_layer_norm,
-      use_norm_conditioning=use_norm_conditioning,
-      rngs=rngs)
-  return output_fns
-
-
-def _build_update_fns_for_edge_types(
-    *,
-    builder_fn, 
-    graph_template,
-    mlp_hidden_size,
-    mlp_num_hidden_layers,
-    activation,
-    use_layer_norm,
-    use_norm_conditioning,
-    rngs,
-    input_sizes=None,
-    output_sizes = None
-    ):
-  """Builds an edge function for all node types or a subset of them."""
-  output_fns = {}
-  for edge_set_key in graph_template.edges.keys():
-    edge_set_name = edge_set_key.name
-    if output_sizes is None:
-      # Use the default output size for all types.
-      output_size = None
-    else:
-      # Otherwise, ignore any type that does not have an explicit output size.
-      if edge_set_name in output_sizes:
-        output_size = output_sizes[edge_set_name]
-      else:
-        continue
-
-    if input_sizes is None:
-      input_size = graph_template.edges[edge_set_key].features.shape[-1]
-    else:
-      input_size = input_sizes[edge_set_key]
-
-    output_fns[edge_set_name] = builder_fn(
-        mlp_input_size=input_size,
-        mlp_hidden_size=mlp_hidden_size,
-        mlp_num_hidden_layers=mlp_num_hidden_layers,
-        mlp_output_size=output_size,
-        activation=activation,
-        use_layer_norm=use_layer_norm,
-        use_norm_conditioning=use_norm_conditioning,
-        rngs=rngs)
-  return output_fns
-
-
-def _get_activation_fn(name):
-  """Return activation function corresponding to function_name."""
-  if name == "identity":
-    return lambda x: x
-  if hasattr(nnx, name):
-    return getattr(nnx, name)
-  if hasattr(jax.nn, name):
-    return getattr(jax.nn, name)
-  if hasattr(jnp, name):
-    return getattr(jnp, name)
-  raise ValueError(f"Unknown activation function {name} specified.")
-
-
-def _get_aggregate_edges_for_nodes_fn(name):
-  """Return aggregate_edges_for_nodes_fn corresponding to function_name."""
-  if hasattr(jraph, name):
-    return getattr(jraph, name)
-  raise ValueError(
-      f"Unknown aggregate_edges_for_nodes_fn function {name} specified.")

@@ -13,20 +13,19 @@
 # limitations under the License.
 """A Transformer model for weather predictions.
 
-This model wraps the a transformer model and swaps the leading two axes of the
+This model wraps the transformer model and swaps the leading two axes of the
 nodes in the input graph prior to evaluating the model to make it compatible
 with a [nodes, batch, ...] ordering of the inputs.
 """
 
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Type
 
 from common import typed_graph
-import haiku as hk
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy import sparse
-
 
 Kwargs = Mapping[str, Any]
 
@@ -57,39 +56,43 @@ def _get_adj_matrix_for_edge_set(
   return adj_mat
 
 
-class MeshTransformer(hk.Module):
+# Let's define a type alias for the Transformer class.
+
+from typing import TypeVar
+Transformer = TypeVar('Transformer', bound=nnx.Module)
+
+class MeshTransformer(nnx.Module):
   """A Transformer for inputs with ordering [nodes, batch, ...]."""
 
+  # Store the transformer_ctor as a type hint, not an instantiated module.
+  _transformer_ctor: Type[Transformer]
+  _transformer_kwargs: Kwargs
+
   def __init__(self,
-               transformer_ctor,
+               transformer_ctor: Type[Transformer], # Expects the NNX Transformer class
                transformer_kwargs: Kwargs,
-               name: Optional[str] = None):
+               *, # rngs must be a keyword argument
+               rngs: nnx.Rngs,
+               ):
     """Initialises the Transformer model.
 
     Args:
-      transformer_ctor: Constructor for transformer.
+      transformer_ctor: Constructor for transformer (the NNX Transformer class).
       transformer_kwargs: Kwargs to pass to the transformer module.
-      name: Optional name for haiku module.
+      rngs: The PRNG key for initializing any submodules.
+      name: Optional name for nnx module.
     """
-    super().__init__(name=name)
-    # We defer the transformer initialisation to the first call to __call__,
-    # where we can build the mask senders and receivers of the TypedGraph
-    self._batch_first_transformer = None
+    # We store the constructor and kwargs. The actual transformer module
+    # will be initialized lazily in the first call.
     self._transformer_ctor = transformer_ctor
     self._transformer_kwargs = transformer_kwargs
+    # The actual transformer instance, initialized to None.
+    # This will be an nnx.Module when instantiated.
+    self.batch_first_transformer: Optional[Transformer] = None
 
-  @hk.name_like('__init__')
-  def _maybe_init_batch_first_transformer(self, x: typed_graph.TypedGraph):
-    if self._batch_first_transformer is not None:
-      return
-    self._batch_first_transformer = self._transformer_ctor(
-        adj_mat=_get_adj_matrix_for_edge_set(
-            graph=x,
-            edge_set_name='mesh',
-            add_self_edges=True,
-        ),
-        **self._transformer_kwargs,
-    )
+    # Store the rngs for later use when initializing the sub-module.
+    # This is crucial for NNX's state management.
+    self.rngs = rngs
 
   def __call__(
       self, x: typed_graph.TypedGraph,
@@ -102,17 +105,28 @@ class MeshTransformer(hk.Module):
           f'Expected x.nodes to have key `mesh_nodes`, got {x.nodes.keys()}.'
       )
     features = x.nodes['mesh_nodes'].features
-    if features.ndim != 3:  # pytype: disable=attribute-error  # jax-ndarray
+    if features.ndim != 3:
       raise ValueError(
           'Expected `x.nodes["mesh_nodes"].features` to be 3, got'
           f' {features.ndim}.'
-      )  # pytype: disable=attribute-error  # jax-ndarray
+      )
 
-    # Initialise transformer and mask.
-    self._maybe_init_batch_first_transformer(x)
+    # Lazy initialization of the transformer.
+    # This block will only run on the very first forward pass.
+    if self.batch_first_transformer is None:
+
+      self.batch_first_transformer = self._transformer_ctor(
+          adj_mat=_get_adj_matrix_for_edge_set(
+              graph=x,
+              edge_set_name='mesh',
+              add_self_edges=True,
+          ),
+          rngs=self.rngs, # Pass the derived rngs
+          **self._transformer_kwargs,
+      )
 
     y = jnp.transpose(features, axes=[1, 0, 2])
-    y = self._batch_first_transformer(y, global_norm_conditioning)
+    y = self.batch_first_transformer(y, global_norm_conditioning)
     y = jnp.transpose(y, axes=[1, 0, 2])
     x = x._replace(
         nodes={
