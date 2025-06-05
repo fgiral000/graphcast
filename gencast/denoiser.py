@@ -26,19 +26,19 @@ from gencast import sparse_transformer
 from gencast import transformer
 from common import typed_graph
 from common import xarray_jax
-import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy import sparse
 import xarray
 
+import flax.nnx as nnx
 
 Kwargs = Mapping[str, Any]
 NoiseLevelEncoder = Callable[[jnp.ndarray], jnp.ndarray]
 
 
-class FourierFeaturesMLP(hk.Module):
+class FourierFeaturesMLP(nnx.Module):
   """A simple MLP applied to Fourier features of values or their logarithms."""
 
   def __init__(self,
@@ -46,8 +46,9 @@ class FourierFeaturesMLP(hk.Module):
                num_frequencies: int,
                output_sizes: Sequence[int],
                apply_log_first: bool = False,
-               w_init: ... = None,
-               activation: ... = jax.nn.gelu,
+               w_init: Optional[nnx.Initializer] = None,
+               activation: Callable = jax.nn.gelu,
+               rngs: nnx.Rngs = nnx.Rngs(0),
                **mlp_kwargs
                ):
     """Initializes the module.
@@ -66,35 +67,57 @@ class FourierFeaturesMLP(hk.Module):
         Weights initializer for the MLP, default setting aims to produce
         approx unit-variance outputs given the input sin/cos features.
       activation:
+        Activation function for the MLP layers.
+      rngs:
+        Random number generator state for parameter initialization.
       **mlp_kwargs:
         Further settings for the MLP.
     """
-    super().__init__()
-    self._base_period = base_period
-    self._num_frequencies = num_frequencies
-    self._apply_log_first = apply_log_first
+    self.base_period = base_period
+    self.num_frequencies = num_frequencies
+    self.apply_log_first = apply_log_first
+    
     if w_init is None:
       # Scale of 2 is appropriate for input layer as sin/cos fourier features
       # have variance 0.5 for random inputs. Also reasonable to use for later
       # layers as relu activation cuts variance in half for inputs to later
       # layers and gelu something close enough too.
-      w_init = hk.initializers.VarianceScaling(
+      w_init = nnx.initializers.variance_scaling(
           2.0, mode="fan_in", distribution="uniform"
       )
-    self._mlp = hk.nets.MLP(
-        output_sizes=output_sizes,
-        w_init=w_init,
-        activation=activation,
-        **mlp_kwargs)
+    
+    # Calculate input features: Fourier features produce 2 * num_frequencies outputs
+    # (sin and cos for each frequency)
+    fourier_features_size = 2 * num_frequencies
+    
+    # Create MLP layers
+    layers = []
+    in_features = fourier_features_size
+    
+    for i, output_size in enumerate(output_sizes):
+      layers.append(nnx.Linear(
+          in_features=in_features,
+          out_features=output_size,
+          kernel_init=w_init,
+          rngs=rngs,
+          **mlp_kwargs
+      ))
+      if i < len(output_sizes) - 1:  # Don't add activation after last layer
+        layers.append(nnx.Lambda(activation))
+      in_features = output_size  # Update for next layer
+    
+    self.mlp = nnx.Sequential(*layers)
 
   def __call__(self, values: jnp.ndarray) -> jnp.ndarray:
-    if self._apply_log_first:
+    if self.apply_log_first:
       values = jnp.log(values)
 
     features = model_utils.fourier_features(
-        values, self._base_period, self._num_frequencies)
+        values, self.base_period, self.num_frequencies)
 
-    return self._mlp(features)
+    return self.mlp(features)
+  
+
 
 
 @chex.dataclass(frozen=True, eq=True)
@@ -133,7 +156,7 @@ class SparseTransformerConfig:
   # Number of heads for self-attention.
   num_heads: int = 4
   # Attention type.
-  attention_type: str = "splash_mha"
+  attention_type: str = "triblockdiag_mha"
   # mask type if splash attention being used.
   mask_type: str = "lazy"
   block_q: int = 1024
@@ -194,7 +217,7 @@ class DenoiserArchitectureConfig:
   node_output_size: Optional[int] = None
 
 
-class Denoiser(base.Denoiser):
+class Denoiser(nnx.Module, base.Denoiser):
   """Wraps a general deterministic Predictor to act as a Denoiser.
 
   This passes an encoding of the noise level as an additional input to the
@@ -209,14 +232,18 @@ class Denoiser(base.Denoiser):
       self,
       noise_encoder_config: Optional[NoiseEncoderConfig],
       denoiser_architecture_config: DenoiserArchitectureConfig,
+      rngs: nnx.Rngs,
   ):
+    self._rngs = rngs
     self._predictor = _DenoiserArchitecture(
         denoiser_architecture_config=denoiser_architecture_config,
+        rngs=self._rngs,
     )
     # Use default values if not specified.
     if noise_encoder_config is None:
       noise_encoder_config = NoiseEncoderConfig()
-    self._noise_level_encoder = FourierFeaturesMLP(**noise_encoder_config)
+    self._noise_level_encoder = FourierFeaturesMLP(**noise_encoder_config,
+                                                   rngs=self._rngs)
 
   def __call__(
       self,
@@ -245,7 +272,7 @@ class Denoiser(base.Denoiser):
         **kwargs)
 
 
-class _DenoiserArchitecture:
+class _DenoiserArchitecture(nnx.Module):
   """GenCast Predictor.
 
   The model works on graphs that take into account:
@@ -277,6 +304,7 @@ class _DenoiserArchitecture:
   def __init__(
       self,
       denoiser_architecture_config: DenoiserArchitectureConfig,
+      rngs: nnx.Rngs,
   ):
     """Initializes the predictor."""
     self._spatial_features_kwargs = dict(
@@ -287,7 +315,7 @@ class _DenoiserArchitecture:
         relative_longitude_local_coordinates=True,
         relative_latitude_local_coordinates=True,
     )
-
+    self._rngs = rngs
     # Construct the mesh.
     mesh = icosahedral_mesh.get_last_triangular_mesh_for_sphere(
         splits=denoiser_architecture_config.mesh_size
@@ -313,7 +341,6 @@ class _DenoiserArchitecture:
             include_sent_messages_in_node_update=False,
             mlp_hidden_size=denoiser_architecture_config.latent_size,
             mlp_num_hidden_layers=denoiser_architecture_config.hidden_layers,
-            name="grid2mesh_gnn",
             node_latent_size=dict(
                 grid_nodes=denoiser_architecture_config.latent_size,
                 mesh_nodes=denoiser_architecture_config.latent_size
@@ -322,16 +349,17 @@ class _DenoiserArchitecture:
             num_message_passing_steps=1,
             use_layer_norm=True,
             use_norm_conditioning=True,
+            rngs=self._rngs,
         )
     )
 
     # Processor - performs multiple rounds of message passing on the mesh.
     self._mesh_gnn = transformer.MeshTransformer(
-        name="mesh_transformer",
         transformer_ctor=sparse_transformer.Transformer,
         transformer_kwargs=dataclasses.asdict(
             denoiser_architecture_config.sparse_transformer_config
         ),
+        rngs=self._rngs,
     )
 
     # Decoder, which moves data from the mesh back into the grid with a single
@@ -347,17 +375,17 @@ class _DenoiserArchitecture:
             include_sent_messages_in_node_update=False,
             mlp_hidden_size=denoiser_architecture_config.latent_size,
             mlp_num_hidden_layers=denoiser_architecture_config.hidden_layers,
-            name="mesh2grid_gnn",
             node_latent_size=dict(
                 grid_nodes=denoiser_architecture_config.latent_size,
                 mesh_nodes=denoiser_architecture_config.latent_size,
             ),
-            node_output_size={
-                "grid_nodes": denoiser_architecture_config.node_output_size
-            },
+            node_output_size=dict(
+                grid_nodes=denoiser_architecture_config.node_output_size
+            ),
             num_message_passing_steps=1,
             use_layer_norm=True,
             use_norm_conditioning=True,
+            rngs=self._rngs,
         )
     )
 

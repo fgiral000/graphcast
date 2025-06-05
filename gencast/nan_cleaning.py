@@ -22,9 +22,10 @@ from typing import Optional, Tuple
 from common import predictor_base as base
 import numpy as np
 import xarray
+import flax.nnx as nnx
 
 
-class NaNCleaner(base.Predictor):
+class NaNCleaner(nnx.Module, base.Predictor):
   """A predictor wrapper than removes NaNs from ingested data.
 
   The Predictor which is wrapped sees inputs and targets without NaNs.
@@ -32,7 +33,7 @@ class NaNCleaner(base.Predictor):
 
   def __init__(
       self,
-      predictor: base.Predictor,
+      predictor: nnx.Module,
       var_to_clean: str,
       fill_value: xarray.Dataset,
       reintroduce_nans: bool = False,

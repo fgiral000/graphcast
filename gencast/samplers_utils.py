@@ -21,7 +21,7 @@ import chex
 from dinosaur import spherical_harmonic
 from common import xarray_jax
 from common import xarray_tree
-import haiku as hk
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -316,19 +316,19 @@ def sample(
   return result.transpose(*template.dims)
 
 
-def spherical_white_noise_like(template: xarray.Dataset) -> xarray.Dataset:
+def spherical_white_noise_like(template: xarray.Dataset, rngs: nnx.Rngs) -> xarray.Dataset:
   """Samples isotropic mean 0 variance 1 white noise on the sphere."""
-  def spherical_white_noise_like_dataarray(data_array: xarray.DataArray
-                                           ) -> xarray.DataArray:
-    num_wavenumbers = data_array.lon.shape[0] // 2
-    key = hk.next_rng_key()
-    return sample(
-        key=key,
-        power_spectrum=xarray_jax.DataArray(
-            data=np.array([1/num_wavenumbers for _ in range(num_wavenumbers)]),
-            dims=['total_wavenumber']),
-        template=data_array)
+  def spherical_white_noise_like_dataarray(data_array: xarray.DataArray) -> xarray.DataArray:
+      num_wavenumbers = data_array.lon.shape[0] // 2
+      key = rngs.params()  # Generate a new key from the 'params' stream
+      return sample(
+          key=key,
+          power_spectrum=xarray_jax.DataArray(
+              data=np.array([1 / num_wavenumbers for _ in range(num_wavenumbers)]),
+              dims=['total_wavenumber']),
+          template=data_array)
   return template.map(spherical_white_noise_like_dataarray)
+
 
 
 def rho_inverse_cdf(
@@ -420,6 +420,7 @@ def apply_stochastic_churn(
     noise_level: jax.typing.ArrayLike,
     stochastic_churn_rate: jax.typing.ArrayLike,
     noise_level_inflation_factor: jax.typing.ArrayLike,
+    rngs: nnx.Rngs,
 ) -> tuple[Any, jax.typing.ArrayLike]:
   """Returns x at higher noise level, and the higher noise level itself."""
   # We increase the noise level of x a bit before taking it down again:
@@ -431,6 +432,6 @@ def apply_stochastic_churn(
   # it's negative.
   noise_diff = jnp.maximum(noise_diff, 0)
   extra_noise_stddev = jnp.sqrt(noise_diff)* noise_level_inflation_factor
-  updated_x = x + spherical_white_noise_like(x) * extra_noise_stddev
+  updated_x = x + spherical_white_noise_like(x, rngs=rngs) * extra_noise_stddev
   return updated_x, new_noise_level
 

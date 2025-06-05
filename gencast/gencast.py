@@ -31,7 +31,7 @@ from common import losses
 from common import predictor_base
 from gencast import samplers_utils
 from common import xarray_jax
-import haiku as hk
+import flax.nnx as nnx
 import jax
 import xarray
 
@@ -127,7 +127,7 @@ class CheckPoint:
   noise_encoder_config: denoiser.NoiseEncoderConfig
 
 
-class GenCast(predictor_base.Predictor):
+class GenCast(nnx.Module, predictor_base.Predictor):
   """Predictor for a denoising diffusion model following the framework of [1].
 
     [1] Elucidating the Design Space of Diffusion-Based Generative Models
@@ -149,6 +149,7 @@ class GenCast(predictor_base.Predictor):
       sampler_config: Optional[SamplerConfig] = None,
       noise_config: Optional[NoiseConfig] = None,
       noise_encoder_config: Optional[denoiser.NoiseEncoderConfig] = None,
+      rngs: nnx.Rngs = nnx.Rngs(0),
   ):
     """Constructs GenCast."""
     # Output size depends on number of variables being predicted.
@@ -164,15 +165,23 @@ class GenCast(predictor_base.Predictor):
         num_surface_vars
         + len(task_config.pressure_levels) * num_atmospheric_vars
     )
+
+    self._rngs = rngs
     denoiser_architecture_config.node_output_size = num_outputs
     self._denoiser = denoiser.Denoiser(
         noise_encoder_config,
         denoiser_architecture_config,
+        rngs=self._rngs,
     )
     self._sampler_config = sampler_config
-    # Singleton to avoid re-initializing the sampler for each inference call.
-    self._sampler = None
     self._noise_config = noise_config
+    # Singleton to avoid re-initializing the sampler for each inference call.
+    self._sampler = dpm_solver_plus_plus_2s.Sampler(
+          self._denoiser,
+          rngs=self._rngs,
+          **self._sampler_config,
+      )
+    
 
   def _c_in(self, noise_scale: xarray.DataArray) -> xarray.DataArray:
     """Scaling applied to the noisy targets input to the underlying network."""
@@ -226,7 +235,7 @@ class GenCast(predictor_base.Predictor):
 
     # Sample noise levels:
     dtype = casting.infer_floating_dtype(targets)  # pytype: disable=wrong-arg-types
-    key = hk.next_rng_key()
+    key = self._rngs.params()
     batch_size = inputs.sizes['batch']
     noise_levels = xarray_jax.DataArray(
         data=samplers_utils.rho_inverse_cdf(
@@ -238,7 +247,7 @@ class GenCast(predictor_base.Predictor):
 
     # Sample noise and apply it to targets:
     noise = (
-        samplers_utils.spherical_white_noise_like(targets) * noise_levels
+        samplers_utils.spherical_white_noise_like(targets, rngs=self._rngs) * noise_levels
     )
     noisy_targets = targets + noise
 
@@ -273,12 +282,4 @@ class GenCast(predictor_base.Predictor):
                targets_template: xarray.Dataset,
                forcings: Optional[xarray.Dataset] = None,
                **kwargs) -> xarray.Dataset:
-    if self._sampler_config is None:
-      raise ValueError(
-          'Sampler config must be specified to run inference on GenCast.'
-      )
-    if self._sampler is None:
-      self._sampler = dpm_solver_plus_plus_2s.Sampler(
-          self._preconditioned_denoiser, **self._sampler_config
-      )
     return self._sampler(inputs, targets_template, forcings, **kwargs)

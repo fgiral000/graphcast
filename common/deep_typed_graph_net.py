@@ -211,7 +211,6 @@ class DeepTypedGraphNet(nnx.Module):
                f32_aggregation: bool = False,
                aggregate_edges_for_nodes_fn: str = "segment_sum",
                aggregate_normalization: Optional[float] = None,
-               name: str = "DeepTypedGraphNet",
                rngs: nnx.Rngs):
     """Inits the model.
 
@@ -259,8 +258,6 @@ class DeepTypedGraphNet(nnx.Module):
         segment_mean.
       name: Name of the model.
     """
-    super().__init__(name=name)
-
     # Store all parameters except graph_template
     self._node_latent_size = node_latent_size
     self._edge_latent_size = edge_latent_size
