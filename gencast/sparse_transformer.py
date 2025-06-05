@@ -29,7 +29,8 @@ from typing import Any, Callable, Literal, Optional, Tuple
 
 from common import mlp as mlp_builder
 from gencast import sparse_transformer_utils as utils
-import haiku as hk
+
+import flax.nnx as nnx
 import jax
 from jax.experimental.pallas.ops.tpu import splash_attention
 import jax.numpy as jnp
@@ -89,6 +90,8 @@ class _ModelConfig:
       self.value_size = self.d_model // self.num_heads
 
 
+################################################# Attention utils ################################################
+
 def get_mask_block_size(mask: sp.sparse.csr_matrix) -> int:
   """Get blocksize of the adjacency matrix (attn mask) for the permuted mesh."""
   # sub-diagonal bandwidth
@@ -101,16 +104,6 @@ def get_mask_block_size(mask: sp.sparse.csr_matrix) -> int:
   block_size = np.maximum(lbandwidth, ubandwidth)
   return block_size
 
-
-def ffw(x: jnp.ndarray, cfg: _ModelConfig) -> jnp.ndarray:
-  """Feed-forward block."""
-  ffw_winit = hk.initializers.VarianceScaling(cfg.ffw_winit_mult /
-                                              cfg.num_layers)
-  ffw_winit_final = hk.initializers.VarianceScaling(cfg.ffw_winit_final_mult /
-                                                    cfg.num_layers)
-  x = hk.Linear(cfg.ffw_hidden, name='ffw_up', w_init=ffw_winit)(x)
-  x = getattr(jax.nn, cfg.activation)(x)
-  return hk.Linear(cfg.d_model, name='ffw_down', w_init=ffw_winit_final)(x)
 
 
 def triblockdiag_softmax(logits: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
@@ -139,106 +132,6 @@ def triblockdiag_softmax(logits: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
   logits_l = unnormalized_l / denom
 
   return (logits_d, logits_u, logits_l)
-
-
-def triblockdiag_mha(q_input: jnp.ndarray, kv_input: jnp.ndarray,
-                     mask: jnp.ndarray, cfg: _ModelConfig,
-                     ) -> jnp.ndarray:
-  """Triblockdiag multihead attention."""
-
-  # q_inputs, kv_input: (batch, num_blocks, block_size, num_heads, d_model)
-  q = multihead_linear(q_input, 'q', cfg)
-  k = multihead_linear(kv_input, 'k', cfg)
-  v = multihead_linear(kv_input, 'v', cfg)
-
-  k = jnp.pad(k, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
-  v = jnp.pad(v, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
-
-  def qk_prod(queries, keys):
-    return jnp.einsum('bnqhd,bnkhd->bnhqk', queries, keys)
-
-  # q shape is (batch, num_blocks, block_size, num_heads, qk_dim)
-  # k shape is (batch, num_blocks + 2, block_size, num_heads, qk_dim)
-  logits_d = qk_prod(q, k[:, 1:-1, ...]) * cfg.key_size**-0.5
-  logits_u = qk_prod(q, k[:, 2:, ...]) * cfg.key_size**-0.5
-  logits_l = qk_prod(q, k[:, :-2, ...]) * cfg.key_size**-0.5
-
-  # apply mask
-  logits_d = jnp.where(mask[:, 0, ...], logits_d, -1e30)
-  logits_u = jnp.where(mask[:, 1, ...], logits_u, -1e30)
-  logits_l = jnp.where(mask[:, 2, ...], logits_l, -1e30)
-
-  logits_d, logits_u, logits_l = utils.wrap_fn_for_upcast_downcast(
-      (logits_d, logits_u, logits_l),
-      triblockdiag_softmax
-      )
-
-  def av_prod(attn_weights, values):
-    return jnp.einsum('bnhqk,bnkhd->bnqhd', attn_weights, values)
-
-  out_d = av_prod(logits_d, v[:, 1:-1, ...])
-  out_u = av_prod(logits_u, v[:, 2:, ...])
-  out_l = av_prod(logits_l, v[:, :-2, ...])
-  # x shape is (batch, num_blocks, block_size, num_heads, d_model)
-  x = out_d + out_u + out_l
-
-  x = jnp.reshape(x, x.shape[:-2] + (cfg.num_heads * cfg.value_size,))
-  attn_winit_final = hk.initializers.VarianceScaling(
-      cfg.attn_winit_final_mult / cfg.num_layers)
-  x = hk.Linear(cfg.d_model, name='mha_final', w_init=attn_winit_final)(x)
-  return x
-
-
-def multihead_linear(
-    x: jnp.ndarray, qkv: str, cfg: _ModelConfig
-) -> jnp.ndarray:
-  """Linearly project `x` to have `head_size` dimensions per head."""
-  head_size = cfg.value_size if qkv == 'v' else cfg.key_size
-  attn_winit = hk.initializers.VarianceScaling(cfg.attn_winit_mult /
-                                               cfg.num_layers)
-  out = hk.Linear(
-      cfg.num_heads * head_size,
-      w_init=attn_winit,
-      name='mha_proj_' + qkv,
-      with_bias=False,
-  )(x)
-  shape = out.shape[:-1] + (cfg.num_heads, head_size)
-  return jnp.reshape(out, shape)
-
-
-def mha(q_input: jnp.ndarray, kv_input: jnp.ndarray,
-        mask: jnp.ndarray, cfg: _ModelConfig,
-        normalize_logits: bool = True,
-        ) -> jnp.ndarray:
-  """Multi head attention."""
-
-  q = multihead_linear(q_input, 'q', cfg)
-  k = multihead_linear(kv_input, 'k', cfg)
-  v = multihead_linear(kv_input, 'v', cfg)
-
-  logits = jnp.einsum('bthd, bThd->bhtT', q, k)
-  if normalize_logits:
-    logits *= cfg.key_size**-0.5
-  if mask is not None:
-    def apply_mask(m, l):
-      return jnp.where(m, l, -1e30)
-    logits = jax.vmap(jax.vmap(
-        apply_mask, in_axes=[None, 0]), in_axes=[None, 0])(mask, logits)
-
-  # Wrap softmax weights for upcasting & downcasting in case of BF16 activations
-  weights = utils.wrap_fn_for_upcast_downcast(logits, jax.nn.softmax)
-
-  # Note: our mask never has all 0 rows, since nodes always have self edges,
-  # so no need to account for that possibility explicitly.
-
-  x = jnp.einsum('bhtT,bThd->bthd', weights, v)
-  x = jnp.reshape(x, x.shape[:-2] + (cfg.num_heads * cfg.value_size,))
-
-  attn_winit_final = hk.initializers.VarianceScaling(
-      cfg.attn_winit_final_mult / cfg.num_layers)
-
-  x = hk.Linear(cfg.d_model, name='mha_final', w_init=attn_winit_final)(x)
-  return x
 
 
 def _make_splash_mha(
@@ -274,59 +167,6 @@ def _make_splash_mha(
                                           )
   return attn
 
-
-def splash_mha(q_input: jnp.ndarray, kv_input: jnp.ndarray,
-               mask: jnp.ndarray | splash_attention.splash_attention_mask.Mask,
-               cfg: _ModelConfig,
-               tanh_soft_cap: Optional[float] = None,
-               normalize_q: bool = True) -> jnp.ndarray:
-  """Splash attention."""
-
-  q = multihead_linear(q_input, 'q', cfg)
-  k = multihead_linear(kv_input, 'k', cfg)
-  v = multihead_linear(kv_input, 'v', cfg)
-
-  _, _, num_heads, head_dim = q.shape
-
-  assert head_dim % 128 == 0  # splash attention kernel requires this
-
-  attn = _make_splash_mha(
-      mask=mask,
-      mask_type=cfg.mask_type,
-      num_heads=num_heads,
-      block_q=cfg.block_q,
-      block_kv=cfg.block_kv,
-      block_kv_compute=cfg.block_kv_compute,
-      block_q_dkv=cfg.block_q_dkv,
-      block_kv_dkv=cfg.block_kv_dkv,
-      block_kv_dkv_compute=cfg.block_kv_dkv_compute,
-      tanh_soft_cap=tanh_soft_cap,
-  )
-  attn = jax.vmap(attn)  # Add batch axis.
-
-  if normalize_q:
-    q *= cfg.key_size**-0.5
-
-  # (batch, nodes, num_heads, head_dim) -> (batch, num_heads, nodes, head_dim)
-  reformat = lambda y: y.transpose(0, 2, 1, 3)
-  x = attn(q=reformat(q), k=reformat(k), v=reformat(v))
-  x = x.transpose(0, 2, 1, 3)
-
-  x = jnp.reshape(x, x.shape[:-2] + (cfg.num_heads * cfg.value_size,))
-
-  attn_winit_final = hk.initializers.VarianceScaling(
-      cfg.attn_winit_final_mult / cfg.num_layers)
-
-  x = hk.Linear(cfg.d_model, name='mha_final', w_init=attn_winit_final)(x)
-  return x
-
-
-def layernorm(
-    x: jnp.ndarray, create_scale: bool, create_offset: bool
-) -> jnp.ndarray:
-  return hk.LayerNorm(
-      axis=-1, create_scale=create_scale, create_offset=create_offset,
-      name='norm')(x)
 
 
 def mask_block_diags(mask: sp.sparse.csr_matrix,
@@ -366,6 +206,7 @@ def mask_block_diags(mask: sp.sparse.csr_matrix,
   return mask
 
 
+
 def _pad_mask(mask, num_padding_nodes: Tuple[int, int]) -> jnp.ndarray:
   q_padding, kv_padding = num_padding_nodes
   mask_padding_rows = sp.sparse.csr_matrix(
@@ -375,6 +216,7 @@ def _pad_mask(mask, num_padding_nodes: Tuple[int, int]) -> jnp.ndarray:
       (mask.shape[0], kv_padding), dtype=np.bool_)
   mask = sp.sparse.hstack([mask, mask_padding_cols])
   return mask
+
 
 
 class WeatherMeshMask(splash_attention.splash_attention_mask.Mask):
@@ -408,76 +250,287 @@ class WeatherMeshMask(splash_attention.splash_attention_mask.Mask):
     return self.mask[q_slice, kv_slice].toarray()
 
 
-class Block(hk.Module):
+
+
+############################################# NNX Modules #############################################
+
+class FeedForward(nnx.Module):
+  """Feed-forward block."""
+  
+  def __init__(self, cfg: _ModelConfig, rngs: nnx.Rngs):
+    ffw_winit = nnx.initializers.variance_scaling(cfg.ffw_winit_mult / cfg.num_layers, 
+                                                  'fan_in', 'truncated_normal')
+    ffw_winit_final = nnx.initializers.variance_scaling(cfg.ffw_winit_final_mult / cfg.num_layers, 
+                                                  'fan_in', 'truncated_normal')
+    self.mlp = nnx.Sequential(
+      nnx.Linear(in_features=cfg.d_model, out_features=cfg.ffw_hidden, 
+                 kernel_init=ffw_winit, rngs=rngs),
+      getattr(nnx, cfg.activation),
+      nnx.Linear(in_features=cfg.ffw_hidden, out_features=cfg.d_model,
+                 kernel_init=ffw_winit_final, rngs=rngs),
+    )
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    return self.mlp(x)
+
+
+class MultiheadLinear(nnx.Module):
+  """Linearly project `x` to have `head_size` dimensions per head."""
+  def __init__(self, qkv: str, cfg: _ModelConfig, *, rngs: nnx.Rngs):
+    head_size = cfg.value_size if qkv == 'v' else cfg.key_size
+    attn_winit = nnx.initializers.variance_scaling(cfg.attn_winit_mult / cfg.num_layers, 
+                                                  'fan_in', 'truncated_normal')
+    self.linear = nnx.Linear(
+        cfg.d_model, # Input features
+        cfg.num_heads * head_size,
+        kernel_init=attn_winit,
+        use_bias=False,
+        rngs=rngs,
+    )
+    self.head_size = head_size
+    self.num_heads = cfg.num_heads
+
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    out = self.linear(x)
+    shape = out.shape[:-1] + (self.num_heads, self.head_size)
+    return jnp.reshape(out, shape)
+
+
+
+class TriblockdiagMHA(nnx.Module):
+  """Triblockdiag multihead attention."""
+  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs):
+    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs)
+    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs)
+    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs)
+
+    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 
+                                                        'fan_in', 'truncated_normal')
+    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, 
+                                   out_features=self._cfg.d_model, 
+                                   kernel_init=attn_winit_final, 
+                                   rngs=self.rngs)
+
+    self._cfg = cfg
+
+  def __call__(self, q_input: jnp.ndarray, kv_input: jnp.ndarray,
+               mask: jnp.ndarray) -> jnp.ndarray:
+    # q_inputs, kv_input: (batch, num_blocks, block_size, num_heads, d_model)
+    q = self.q_proj(q_input)
+    k = self.k_proj(kv_input)
+    v = self.v_proj(kv_input)
+
+    k = jnp.pad(k, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
+    v = jnp.pad(v, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
+
+    def qk_prod(queries, keys):
+      return jnp.einsum('bnqhd,bnkhd->bnhqk', queries, keys)
+
+    # q shape is (batch, num_blocks, block_size, num_heads, qk_dim)
+    # k shape is (batch, num_blocks + 2, block_size, num_heads, qk_dim)
+    logits_d = qk_prod(q, k[:, 1:-1, ...]) * self._cfg.key_size**-0.5
+    logits_u = qk_prod(q, k[:, 2:, ...]) * self._cfg.key_size**-0.5
+    logits_l = qk_prod(q, k[:, :-2, ...]) * self._cfg.key_size**-0.5
+
+    # apply mask
+    logits_d = jnp.where(mask[:, 0, ...], logits_d, -1e30)
+    logits_u = jnp.where(mask[:, 1, ...], logits_u, -1e30)
+    logits_l = jnp.where(mask[:, 2, ...], logits_l, -1e30)
+
+    logits_d, logits_u, logits_l = utils.wrap_fn_for_upcast_downcast(
+        (logits_d, logits_u, logits_l),
+        triblockdiag_softmax
+        )
+
+    def av_prod(attn_weights, values):
+      return jnp.einsum('bnhqk,bnkhd->bnqhd', attn_weights, values)
+
+    out_d = av_prod(logits_d, v[:, 1:-1, ...])
+    out_u = av_prod(logits_u, v[:, 2:, ...])
+    out_l = av_prod(logits_l, v[:, :-2, ...])
+    # x shape is (batch, num_blocks, block_size, num_heads, d_model)
+    x = out_d + out_u + out_l
+
+    x = jnp.reshape(x, x.shape[:-2] + (self._cfg.num_heads * self._cfg.value_size,))
+
+    x = self.final_linear(x)
+    return x
+
+
+
+class MHA(nnx.Module):
+  """Multi head attention."""
+  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs):
+    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs)
+    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs)
+    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs)
+
+    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 
+                                                         'fan_in', 'truncated_normal')
+    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, 
+                                   out_features=self._cfg.d_model, 
+                                   kernel_init=attn_winit_final, 
+                                   rngs=self.rngs)
+
+    self._cfg = cfg
+
+  def __call__(self, q_input: jnp.ndarray, kv_input: jnp.ndarray,
+               mask: jnp.ndarray, normalize_logits: bool = True) -> jnp.ndarray:
+
+    q = self.q_proj(q_input)
+    k = self.k_proj(kv_input)
+    v = self.v_proj(kv_input)
+
+    logits = jnp.einsum('bthd, bThd->bhtT', q, k)
+    if normalize_logits:
+      logits *= self._cfg.key_size**-0.5
+    if mask is not None:
+      def apply_mask(m, l):
+        return jnp.where(m, l, -1e30)
+      logits = jax.vmap(jax.vmap(
+          apply_mask, in_axes=[None, 0]), in_axes=[None, 0])(mask, logits)
+
+    # Wrap softmax weights for upcasting & downcasting in case of BF16 activations
+    weights = utils.wrap_fn_for_upcast_downcast(logits, jax.nn.softmax)
+
+    # Note: our mask never has all 0 rows, since nodes always have self edges,
+    # so no need to account for that possibility explicitly.
+
+    x = jnp.einsum('bhtT,bThd->bthd', weights, v)
+    x = jnp.reshape(x, x.shape[:-2] + (self._cfg.num_heads * self._cfg.value_size,))
+
+    x = self.final_linear(x)
+    return x
+
+
+class SplashMHA(nnx.Module):
+  """Splash attention."""
+  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs):
+    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs)
+    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs)
+    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs)
+
+    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 
+                                                         'fan_in', 'truncated_normal')
+
+    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, 
+                              out_features=self._cfg.d_model, 
+                              kernel_init=attn_winit_final, 
+                              rngs=self.rngs)
+
+    self._cfg = cfg
+
+  def __call__(self, q_input: jnp.ndarray, kv_input: jnp.ndarray,
+               mask: jnp.ndarray | splash_attention.splash_attention_mask.Mask,
+               tanh_soft_cap: Optional[float] = None,
+               normalize_q: bool = True) -> jnp.ndarray:
+
+    q = self.q_proj(q_input)
+    k = self.k_proj(kv_input)
+    v = self.v_proj(kv_input)
+
+    _, _, num_heads, head_dim = q.shape
+
+    assert head_dim % 128 == 0  # splash attention kernel requires this
+
+    attn = _make_splash_mha(
+        mask=mask,
+        mask_type=self._cfg.mask_type,
+        num_heads=num_heads,
+        block_q=self._cfg.block_q,
+        block_kv=self._cfg.block_kv,
+        block_kv_compute=self._cfg.block_kv_compute,
+        block_q_dkv=self._cfg.block_q_dkv,
+        block_kv_dkv=self._cfg.block_kv_dkv,
+        block_kv_dkv_compute=self._cfg.block_kv_dkv_compute,
+        tanh_soft_cap=tanh_soft_cap,
+    )
+    attn = jax.vmap(attn)  # Add batch axis.
+
+    if normalize_q:
+      q *= self._cfg.key_size**-0.5
+
+    # (batch, nodes, num_heads, head_dim) -> (batch, num_heads, nodes, head_dim)
+    reformat = lambda y: y.transpose(0, 2, 1, 3)
+    x = attn(q=reformat(q), k=reformat(k), v=reformat(v))
+    x = x.transpose(0, 2, 1, 3)
+
+    x = jnp.reshape(x, x.shape[:-2] + (self._cfg.num_heads * self._cfg.value_size,))
+
+    x = self.final_linear(x)
+    return x
+
+
+class Block(nnx.Module):
   """Transformer block (mha and ffw)."""
 
-  def __init__(self, cfg, mask, num_nodes, num_padding_nodes, name=None):
-    super().__init__(name=name)
+  def __init__(self, cfg: _ModelConfig, mask: jnp.ndarray, num_nodes: int,
+               num_padding_nodes: Tuple[int, int] | int, *, rngs: nnx.Rngs):
     self._cfg = cfg
     self.mask = mask
     self.num_nodes = num_nodes
     self.num_padding_nodes = num_padding_nodes
 
-  def __call__(self, x, global_norm_conditioning=jax.Array):
+    # Instantiate attention and FFW modules in __init__
+    if self._cfg.attention_type == 'triblockdiag_mha':
+      self.attn_module = TriblockdiagMHA(cfg, rngs=rngs)
+    elif self._cfg.attention_type == 'mha':
+      self.attn_module = MHA(cfg, rngs=rngs)
+    elif self._cfg.attention_type == 'splash_mha':
+      self.attn_module = SplashMHA(cfg, rngs=rngs)
+    else:
+      raise NotImplementedError()
+
+    self.ffw_module = FeedForward(cfg, rngs=rngs)
+
+    # Instantiate LinearNormConditioning and LayerNorm
+    self.norm_cond_attn = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs)
+    self.norm_cond_ffw = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs)
+    self.ln1 = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+    self.ln2 = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+
+
+  def __call__(self, x: jnp.ndarray, global_norm_conditioning: jax.Array):
     # x shape is (batch, num_nodes, feature_dim)
-    def attn(x):
+    def call_attn(x_in):
       if self._cfg.attention_type == 'triblockdiag_mha':
         # We pad -> reshape -> compute attn -> reshape -> select at each block
         # so as to avoid complications involved in making the norm layers and
         # ffw blocks account for the padding. However, this might be decreasing
         # efficiency.
-
-        # Add padding so that number of nodes is divisible into blocks
-        x = jnp.pad(x, ((0, 0), (0, self.num_padding_nodes), (0, 0)))
-        x = x.reshape(x.shape[0],
-                      x.shape[1]//self._cfg.mask_block_size,
-                      self._cfg.mask_block_size,
-                      x.shape[-1])
-        x = triblockdiag_mha(x, x, mask=self.mask, cfg=self._cfg)
-        x = x.reshape(x.shape[0],
-                      self.num_nodes + self.num_padding_nodes,
-                      x.shape[-1])
-        return x[:,:self.num_nodes, :]
+        x_padded = jnp.pad(x_in, ((0, 0), (0, self.num_padding_nodes), (0, 0)))
+        x_reshaped = x_padded.reshape(x_padded.shape[0],
+                                      x_padded.shape[1]//self._cfg.mask_block_size,
+                                      self._cfg.mask_block_size,
+                                      x_padded.shape[-1])
+        x_attn = self.attn_module(x_reshaped, x_reshaped, mask=self.mask)
+        x_attn_reshaped = x_attn.reshape(x_attn.shape[0],
+                                          self.num_nodes + self.num_padding_nodes,
+                                          x_attn.shape[-1])
+        return x_attn_reshaped[:,:self.num_nodes, :]
 
       elif self._cfg.attention_type == 'mha':
-        return mha(x, x, mask=self.mask, cfg=self._cfg)
+        return self.attn_module(x_in, x_in, mask=self.mask)
 
       elif self._cfg.attention_type == 'splash_mha':
-        # We pad -> reshape -> compute attn -> reshape -> select at each block
-        # so as to avoid complications involved in making the norm layers and
-        # ffw blocks account for the padding. However, this might be decreasing
-        # efficiency.
-
         # Add padding so that number of nodes is divisible by block sizes.
-        x = jnp.pad(x, ((0, 0), (0, self.num_padding_nodes[0]), (0, 0)))
-        x = splash_mha(x, x, mask=self.mask, cfg=self._cfg)
-        return x[:,:self.num_nodes, :]
+        x_padded = jnp.pad(x_in, ((0, 0), (0, self.num_padding_nodes[0]), (0, 0)))
+        x_attn = self.attn_module(x_padded, x_padded, mask=self.mask)
+        return x_attn[:,:self.num_nodes, :]
 
       else:
         raise NotImplementedError()
 
-    def norm_conditioning_layer(x):
-      return mlp_builder.LinearNormConditioning(
-          name=self.name+'_norm_conditioning')(
-              x,
-              norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1)
-              )
+    normed_x_attn = self.ln1(x)
+    conditioned_x_attn = self.norm_cond_attn(normed_x_attn, norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1))
+    x = x + call_attn(conditioned_x_attn)
 
-    x = x + attn(
-        norm_conditioning_layer(
-            layernorm(x, create_scale=False, create_offset=False)
-        )
-    )
-    x = x + ffw(
-        norm_conditioning_layer(
-            layernorm(x, create_scale=False, create_offset=False)
-        ),
-        self._cfg,
-    )
+    normed_x_ffw = self.ln2(x)
+    conditioned_x_ffw = self.norm_cond_ffw(normed_x_ffw, norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1))
+    x = x + self.ffw_module(conditioned_x_ffw)
     return x
 
 
-class Transformer(hk.Module):
+class Transformer(nnx.Module):
   """Main transformer module that processes embeddings.
 
   All but the very first and very last layer of a 'classic' Transformer:
@@ -490,8 +543,9 @@ class Transformer(hk.Module):
                attention_k_hop: int,
                attention_type: Literal['splash_mha', 'triblockdiag_mha', 'mha'],
                mask_type: Literal['full', 'lazy'],
-               num_heads=1,
-               name=None,
+               num_heads: int = 1,
+               *,
+               rngs: nnx.Rngs,
                block_q: Optional[int] = None,
                block_kv: Optional[int] = None,
                block_kv_compute: Optional[int] = None,
@@ -499,7 +553,6 @@ class Transformer(hk.Module):
                block_kv_dkv: Optional[int] = None,
                block_kv_dkv_compute: Optional[int] = None,
                **kwargs):
-    super().__init__(name=name)
 
     # Construct mask and deduce block size.
     mask = adj_mat ** attention_k_hop
@@ -554,24 +607,31 @@ class Transformer(hk.Module):
         block_kv_dkv_compute=block_kv_dkv_compute,
         **kwargs)
 
-  def __call__(self, node_features, global_norm_conditioning: jax.Array):
+    # Instantiate all Block modules
+    self.blocks = []
+    for _ in range(self._cfg.num_layers):
+      self.blocks.append(
+          Block(cfg=self._cfg, 
+                mask=self.mask,
+                num_nodes=adj_mat.shape[0], # Pass actual num_nodes from adj_mat
+                num_padding_nodes=self.num_padding_nodes,
+                rngs=rngs # Pass rngs to sub-modules
+                )
+      )
+
+    # Final LayerNorm and LinearNormConditioning
+    self.final_ln = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+    self.final_norm_cond = mlp_builder.LinearNormConditioning(
+        feature_size=self._cfg.d_model, rngs=rngs)
+
+  def __call__(self, node_features: jnp.ndarray, global_norm_conditioning: jax.Array):
     # node_features expected to have shape (batch, num_nodes, d)
     x = node_features
-    for i_layer in range(self._cfg.num_layers):
-      x = Block(cfg=self._cfg, mask=self.mask,
-                num_nodes=node_features.shape[1],
-                num_padding_nodes=self.num_padding_nodes,
-                name='block_%02d' % i_layer
-                )(x, global_norm_conditioning=global_norm_conditioning)
+    for block in self.blocks:
+      x = block(x, global_norm_conditioning=global_norm_conditioning)
 
-    def norm_conditioning_layer(x):
-      return mlp_builder.LinearNormConditioning(
-          name=self.name+'_final_norm_conditioning')(
-              x,
-              norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1)
-              )
-    x = norm_conditioning_layer(
-        layernorm(x, create_scale=False, create_offset=False)
+    x = self.final_norm_cond(
+        self.final_ln(x),
+        norm_conditioning=jnp.expand_dims(global_norm_conditioning, 1)
     )
-
     return x

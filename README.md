@@ -1,4 +1,11 @@
-# Google DeepMind GraphCast and GenCast
+# Google DeepMind GenCast -- Flax NNX reimplementation
+
+This is a reimplementation of **DeepMind's Gencast model** using the new [Flax](https://github.com/google/flax) API: NNX, instead of the Haiku library.
+
+NOTE: Work in progress...
+
+
+# Google DeepMind Graphcast and Gencast
 
 This package contains example code to run and train the weather models used in the research papers [GraphCast](https://www.science.org/doi/10.1126/science.adi2336) and [GenCast](https://arxiv.org/abs/2312.15796).
 

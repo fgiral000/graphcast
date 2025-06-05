@@ -20,12 +20,13 @@ from gencast import denoisers_base
 from gencast import samplers_base as base
 from gencast import samplers_utils as utils
 from common import xarray_jax
-import haiku as hk
+import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
 import xarray
 
 
-class Sampler(base.Sampler):
+class Sampler(nnx.Module, base.Sampler):
   """Sampling using DPM-Solver++ 2S from [1].
 
   This is combined with optional stochastic churn as described in [2].
@@ -43,7 +44,7 @@ class Sampler(base.Sampler):
   """
 
   def __init__(self,
-               denoiser: denoisers_base.Denoiser,
+               denoiser: nnx.Module,
                max_noise_level: float,
                min_noise_level: float,
                num_noise_levels: int,
@@ -51,7 +52,8 @@ class Sampler(base.Sampler):
                stochastic_churn_rate: float,
                churn_min_noise_level: float,
                churn_max_noise_level: float,
-               noise_level_inflation_factor: float
+               noise_level_inflation_factor: float,
+               rngs: nnx.Rngs,
                ):
     """Initializes the sampler.
 
@@ -79,7 +81,6 @@ class Sampler(base.Sampler):
         to remove slightly too much noise / blur too much. S_noise from the
         paper. Only used if stochastic_churn_rate > 0.
     """
-    super().__init__(denoiser)
     self._noise_levels = utils.noise_schedule(
         max_noise_level, min_noise_level, num_noise_levels, rho)
     self._stochastic_churn = stochastic_churn_rate > 0
@@ -87,6 +88,8 @@ class Sampler(base.Sampler):
         self._noise_levels, stochastic_churn_rate, churn_min_noise_level,
         churn_max_noise_level)
     self._noise_level_inflation_factor = noise_level_inflation_factor
+    self._denoiser = denoiser
+    self._rgns = rngs
 
   def __call__(
       self,
@@ -123,7 +126,7 @@ class Sampler(base.Sampler):
         Noisy targets at the next lowest noise level self._noise_levels[i+1].
       """
       def init_noise(template):
-        return noise_levels[0] * utils.spherical_white_noise_like(template)
+        return noise_levels[0] * utils.spherical_white_noise_like(template, rngs=self._rgns)
 
       # Initialise the inputs if i == 0.
       # This is done here to ensure both noise sampler calls can use the same
@@ -141,7 +144,8 @@ class Sampler(base.Sampler):
         x, noise_level = utils.apply_stochastic_churn(
             x, noise_level,
             stochastic_churn_rate=per_step_churn_rates[i],
-            noise_level_inflation_factor=self._noise_level_inflation_factor)
+            noise_level_inflation_factor=self._noise_level_inflation_factor,
+            rngs=self._rgns,)
 
       # Apply one step of the ODE solver to take x down to the next lowest
       # noise level.
@@ -183,5 +187,5 @@ class Sampler(base.Sampler):
     # Init with zeros but apply additional noise at step 0 to initialise the
     # state.
     noise_init = xarray.zeros_like(targets_template)
-    return hk.fori_loop(
+    return jax.lax.fori_loop(
         0, len(noise_levels) - 1, body_fun=body_fn, init_val=noise_init)

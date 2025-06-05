@@ -21,9 +21,10 @@ to the original domain.
 import logging
 from typing import Optional, Tuple
 
-from common import predictor_base
+from common import predictor_base as base
 from common import xarray_tree
 import xarray
+import flax.nnx as nnx
 
 
 def normalize(values: xarray.Dataset,
@@ -70,7 +71,7 @@ def unnormalize(values: xarray.Dataset,
   return xarray_tree.map_structure(unnormalize_array, values)
 
 
-class InputsAndResiduals(predictor_base.Predictor):
+class InputsAndResiduals(nnx.Module, base.Predictor):
   """Wraps with a residual connection, normalizing inputs and target residuals.
 
   The inner predictor is given inputs that are normalized using `locations`
@@ -100,7 +101,7 @@ class InputsAndResiduals(predictor_base.Predictor):
 
   def __init__(
       self,
-      predictor: predictor_base.Predictor,
+      predictor: nnx.Module,
       stddev_by_level: xarray.Dataset,
       mean_by_level: xarray.Dataset,
       diffs_stddev_by_level: xarray.Dataset):
@@ -164,7 +165,7 @@ class InputsAndResiduals(predictor_base.Predictor):
            targets: xarray.Dataset,
            forcings: xarray.Dataset,
            **kwargs,
-           ) -> predictor_base.LossAndDiagnostics:
+           ) -> base.LossAndDiagnostics:
     """Returns the loss computed on normalized inputs and targets."""
     norm_inputs = normalize(inputs, self._scales, self._locations)
     norm_forcings = normalize(forcings, self._scales, self._locations)
@@ -180,7 +181,7 @@ class InputsAndResiduals(predictor_base.Predictor):
       targets: xarray.Dataset,
       forcings: xarray.Dataset,
       **kwargs,
-      ) -> Tuple[predictor_base.LossAndDiagnostics,
+      ) -> Tuple[base.LossAndDiagnostics,
                  xarray.Dataset]:
     """The loss computed on normalized data, with unnormalized predictions."""
     norm_inputs = normalize(inputs, self._scales, self._locations)

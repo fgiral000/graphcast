@@ -70,7 +70,6 @@ class Context(NamedTuple):
 
 class EdgeSetKey(NamedTuple):
   name: str   # Name of the EdgeSet.
-
   # Sender node set name and receiver node set name connected by the edge set.
   node_sets: Tuple[str, str]
 

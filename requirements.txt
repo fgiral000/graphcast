@@ -13,3 +13,6 @@ matplotlib
 numpy
 pandas
 scipy
+dinosaur-dycore
+optax
+grain
