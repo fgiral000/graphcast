@@ -18,7 +18,6 @@ from typing import Any, Mapping, Tuple
 
 import chex
 from common import predictor_base
-import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -51,16 +50,19 @@ class Bfloat16Cast(predictor_base.Predictor):
     if not self._enabled:
       return self._predictor(inputs, targets_template, forcings, **kwargs)
 
-    with bfloat16_variable_view():
-      predictions = self._predictor(
-          *_all_inputs_to_bfloat16(inputs, targets_template, forcings),
-          **kwargs,)
+    # Cast all inputs to bfloat16 before passing to the predictor.
+    # The predictor is assumed to handle its internal precision.
+    predictions = self._predictor(
+        *_all_inputs_to_bfloat16(inputs, targets_template, forcings),
+        **kwargs,)
 
-    predictions_dtype = infer_floating_dtype(predictions)  # pytype: disable=wrong-arg-types
+    predictions_dtype = infer_floating_dtype(predictions)
+    # The wrapped predictor should ideally output bfloat16 if inputs were bfloat16
+    # and it's designed for mixed precision.
     if predictions_dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 output, got {predictions_dtype}')
 
-    targets_dtype = infer_floating_dtype(targets_template)  # pytype: disable=wrong-arg-types
+    targets_dtype = infer_floating_dtype(targets_template)
     return tree_map_cast(
         predictions, input_dtype=jnp.bfloat16, output_dtype=targets_dtype)
 
@@ -73,14 +75,14 @@ class Bfloat16Cast(predictor_base.Predictor):
     if not self._enabled:
       return self._predictor.loss(inputs, targets, forcings, **kwargs)
 
-    with bfloat16_variable_view():
-      loss, scalars = self._predictor.loss(
-          *_all_inputs_to_bfloat16(inputs, targets, forcings), **kwargs)
+    # Cast all inputs to bfloat16 before passing to the predictor.
+    loss, scalars = self._predictor.loss(
+        *_all_inputs_to_bfloat16(inputs, targets, forcings), **kwargs)
 
     if loss.dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 loss, got {loss.dtype}')
 
-    targets_dtype = infer_floating_dtype(targets)  # pytype: disable=wrong-arg-types
+    targets_dtype = infer_floating_dtype(targets)
 
     # Note that casting back the loss to e.g. float32 should not affect data
     # types of the backwards pass, because the first thing the backwards pass
@@ -101,18 +103,18 @@ class Bfloat16Cast(predictor_base.Predictor):
       return self._predictor.loss_and_predictions(inputs, targets, forcings,  # pytype: disable=bad-return-type  # jax-ndarray
                                                   **kwargs)
 
-    with bfloat16_variable_view():
-      (loss, scalars), predictions = self._predictor.loss_and_predictions(
-          *_all_inputs_to_bfloat16(inputs, targets, forcings), **kwargs)
+    # Cast all inputs to bfloat16 before passing to the predictor.
+    (loss, scalars), predictions = self._predictor.loss_and_predictions(
+        *_all_inputs_to_bfloat16(inputs, targets, forcings), **kwargs)
 
     if loss.dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 loss, got {loss.dtype}')
 
-    predictions_dtype = infer_floating_dtype(predictions)  # pytype: disable=wrong-arg-types
+    predictions_dtype = infer_floating_dtype(predictions)
     if predictions_dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 output, got {predictions_dtype}')
 
-    targets_dtype = infer_floating_dtype(targets)  # pytype: disable=wrong-arg-types
+    targets_dtype = infer_floating_dtype(targets)
     return tree_map_cast(((loss, scalars), predictions),
                          input_dtype=jnp.bfloat16, output_dtype=targets_dtype)
 
@@ -147,59 +149,7 @@ def _all_inputs_to_bfloat16(
 def tree_map_cast(inputs: PyTree, input_dtype: np.dtype, output_dtype: np.dtype,
                   ) -> PyTree:
   def cast_fn(x):
-    if x.dtype == input_dtype:
+    if isinstance(x, (jnp.ndarray, np.ndarray)) and x.dtype == input_dtype:
       return x.astype(output_dtype)
+    return x # Return x unchanged if not a numerical array or not the specified input_dtype
   return jax.tree.map(cast_fn, inputs)
-
-
-@contextlib.contextmanager
-def bfloat16_variable_view(enabled: bool = True):
-  """Context for Haiku modules with float32 params, but bfloat16 activations.
-
-  It works as follows:
-  * Every time a variable is requested to be created/set as np.bfloat16,
-    it will create an underlying float32 variable, instead.
-  * Every time a variable a variable is requested as bfloat16, it will check the
-    variable is of float32 type, and cast the variable to bfloat16.
-
-  Note the gradients are still computed and accumulated as float32, because
-  the params returned by init are float32, so the gradient function with
-  respect to the params will already include an implicit casting to float32.
-
-  Args:
-    enabled: Only enables bfloat16 behavior if True.
-
-  Yields:
-    None
-  """
-
-  if enabled:
-    with hk.custom_creator(
-        _bfloat16_creator, state=True), hk.custom_getter(
-            _bfloat16_getter, state=True), hk.custom_setter(
-                _bfloat16_setter):
-      yield
-  else:
-    yield
-
-
-def _bfloat16_creator(next_creator, shape, dtype, init, context):
-  """Creates float32 variables when bfloat16 is requested."""
-  if context.original_dtype == jnp.bfloat16:
-    dtype = jnp.float32
-  return next_creator(shape, dtype, init)
-
-
-def _bfloat16_getter(next_getter, value, context):
-  """Casts float32 to bfloat16 when bfloat16 was originally requested."""
-  if context.original_dtype == jnp.bfloat16:
-    assert value.dtype == jnp.float32
-    value = value.astype(jnp.bfloat16)
-  return next_getter(value)
-
-
-def _bfloat16_setter(next_setter, value, context):
-  """Casts bfloat16 to float32 when bfloat16 was originally set."""
-  if context.original_dtype == jnp.bfloat16:
-    value = value.astype(jnp.float32)
-  return next_setter(value)

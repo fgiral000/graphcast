@@ -216,8 +216,14 @@ class DenoiserArchitectureConfig:
   grid2mesh_aggregate_normalization: Optional[float] = None
   node_output_size: Optional[int] = None
 
+# pick up the two conflicting metaclasses
+Meta1 = nnx.Module.__class__
+Meta2 = base.Denoiser.__class__
 
-class Denoiser(nnx.Module, base.Denoiser):
+class CombinedMeta(Meta1, Meta2):
+    pass
+
+class Denoiser(nnx.Module, base.Denoiser, metaclass=CombinedMeta):
   """Wraps a general deterministic Predictor to act as a Denoiser.
 
   This passes an encoding of the noise level as an additional input to the
